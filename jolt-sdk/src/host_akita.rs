@@ -177,14 +177,12 @@ type AkitaBackend = JoltAkitaBackend<F, PCS>;
 
 /// Which kernels run on the GPU under the `metal` feature.
 ///
-/// The Metal instruction-source ABI packs `pc + 1` into 14 bits, so the
-/// Metal PIOP kernels reject programs whose bytecode has 16383 or more
-/// entries ("booleanity row cannot be represented by the packed Metal ABI").
-/// The rows are built as early as stage 1 (Spartan outer publishes the
-/// instruction read-raf source), so for such programs the automatic choice
-/// is `MetalCommitOnly`: Metal trace commitment and opening, CPU PIOP.
-/// `Hybrid` (booleanity / bytecode / instruction read-raf slots on CPU, the
-/// rest on Metal) works at 2^23 but still hits the ABI at 2^24.
+/// The Metal instruction-source ABI stores `pc + 1` in its own column, and
+/// the shaders index bytecode with 32-bit PCs, so the full Metal backend
+/// handles any bytecode below 2^32 entries. Larger programs fall back to
+/// `MetalCommitOnly`: Metal trace commitment and opening, CPU PIOP.
+/// `Hybrid` keeps the booleanity / bytecode / instruction read-raf slots on
+/// the CPU and the rest on Metal.
 /// `JOLT_AKITA_METAL=full|hybrid|commit|cpu` overrides the automatic choice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BackendMode {
@@ -195,7 +193,7 @@ enum BackendMode {
 }
 
 /// Largest bytecode length the Metal instruction-source ABI can index.
-const METAL_MAX_BYTECODE_LEN: usize = (1 << 14) - 2;
+const METAL_MAX_BYTECODE_LEN: usize = u32::MAX as usize - 1;
 
 fn backend_mode(bytecode_len: usize) -> BackendMode {
     if !cfg!(all(feature = "metal", target_os = "macos")) {
