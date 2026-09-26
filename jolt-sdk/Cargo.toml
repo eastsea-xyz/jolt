@@ -44,6 +44,12 @@ host = [
   "serde/std",
 ]
 
+# Prove with the packed Akita (lattice) commitment scheme instead of Dory,
+# on the optimized CPU backend. Changes the proof type; Dory stays the default.
+akita = ["host", "dep:jolt-akita", "jolt-prover/akita", "jolt-verifier/akita"]
+# Akita with Apple GPU (Metal) commitment and PIOP kernels.
+metal = ["akita", "jolt-prover/metal"]
+
 guest-nostd = ["zeroos-nostd"]
 
 # ZeroOS features
@@ -106,6 +112,7 @@ jolt-sdk-macros.workspace = true
 # Host-only dependencies
 bincode = { workspace = true, optional = true }
 common = { workspace = true, optional = true }
+jolt-akita = { workspace = true, optional = true }
 jolt-crypto = { workspace = true, optional = true }
 jolt-dory = { workspace = true, optional = true }
 jolt-field = { workspace = true, optional = true }

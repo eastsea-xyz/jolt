@@ -3766,6 +3766,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "common",
+ "jolt-akita",
  "jolt-crypto",
  "jolt-dory",
  "jolt-field",

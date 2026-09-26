@@ -1,25 +1,34 @@
 #[cfg(feature = "host")]
+use std::error::Error as StdError;
+#[cfg(all(feature = "host", not(feature = "akita")))]
 use std::{
-    error::Error as StdError,
     io::{Error as IoError, ErrorKind},
     sync::Arc,
 };
 
 #[cfg(feature = "host")]
 use common::constants::RAM_START_ADDRESS;
+#[cfg(any(feature = "host", feature = "guest-verifier"))]
+use jolt_crypto::Bn254G1;
+#[cfg(any(
+    all(feature = "host", not(feature = "akita")),
+    feature = "guest-verifier"
+))]
+use jolt_crypto::Pedersen;
 #[cfg(feature = "host")]
 use jolt_crypto::PedersenSetup;
-#[cfg(any(feature = "host", feature = "guest-verifier"))]
-use jolt_crypto::{Bn254G1, Pedersen};
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 use jolt_dory::DoryHint;
-#[cfg(any(feature = "host", feature = "guest-verifier"))]
+#[cfg(any(
+    all(feature = "host", not(feature = "akita")),
+    feature = "guest-verifier"
+))]
 use jolt_dory::{DoryCommitment, DoryScheme};
 #[cfg(any(feature = "host", feature = "guest-verifier"))]
 use jolt_field::Fr;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 use jolt_prover::dory::stages::stage0::TrustedAdviceCommitment;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 use jolt_prover::{JoltProverPreprocessing as GenericJoltProverPreprocessing, ProverConfig};
 #[cfg(all(
     any(feature = "host", feature = "guest-verifier"),
@@ -43,9 +52,9 @@ use jolt_transcript::LegacyBlake2bTranscript;
     feature = "transcript-poseidon"
 ))]
 use jolt_transcript::PoseidonTranscript;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 use jolt_verifier::ProgramPreprocessing as GenericProgramPreprocessing;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 use jolt_witness::{JoltVmWitnessConfig, JoltVmWitnessInputs, TraceBackend as WitnessTraceBackend};
 #[cfg(feature = "host")]
 use tracer::TracerInlineExpansionProvider;
@@ -76,7 +85,7 @@ pub type ProtocolTranscript = LegacyBlake2bTranscript<Fr>;
     ))
 ))]
 pub type ProtocolTranscript = LegacyBlake2bTranscript<Fr>;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type ProofTranscript = ProtocolTranscript;
 #[cfg(feature = "host")]
 pub use jolt_program::execution::{
@@ -86,9 +95,9 @@ pub use jolt_program::execution::{
 pub use tracer::TracerBackend;
 
 pub use common::jolt_device::{JoltDevice, MemoryConfig, MemoryLayout};
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub use jolt_dory::DoryScheme as PCS;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub use jolt_field::{Fr as F, JoltField};
 #[cfg(feature = "host")]
 pub use jolt_openings::CommitmentScheme;
@@ -96,31 +105,31 @@ pub use jolt_openings::CommitmentScheme;
 pub use jolt_program::preprocess::JoltProgramPreprocessing;
 #[cfg(feature = "host")]
 pub use jolt_prover::{CommittedProgramProverData, JoltSharedPreprocessing, PreprocessingError};
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type JoltProverPreprocessing = GenericJoltProverPreprocessing<PCS, VerifierVC>;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type ProgramPreprocessing = GenericProgramPreprocessing<PCS>;
 #[cfg(feature = "host")]
 pub use tracer::AdviceTape;
 
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type VerifierPCS = DoryScheme;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type VerifierVC = Pedersen<Bn254G1>;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type VerifierField = jolt_field::Fr;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type VerifierTranscript = ProtocolTranscript;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type JoltVerifierPreprocessing =
     jolt_verifier::JoltVerifierPreprocessing<VerifierPCS, VerifierVC>;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type RV64IMACProof = jolt_verifier::JoltProof<VerifierPCS, VerifierVC>;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type JoltProof = RV64IMACProof;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type VerifierTrustedAdviceCommitment = DoryCommitment;
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub type TrustedAdviceOpeningHint = DoryHint;
 
 #[cfg(feature = "host")]
@@ -158,7 +167,7 @@ pub fn preprocess_shared_program(
     )?)
 }
 
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub fn preprocess_program(
     source: &mut dyn host::JoltProgramSource,
     memory_config: MemoryConfig,
@@ -172,7 +181,7 @@ pub fn preprocess_program(
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 pub fn verifier_preprocessing_from_prover(
     prover: &JoltProverPreprocessing,
 ) -> JoltVerifierPreprocessing {
@@ -270,7 +279,7 @@ pub fn compute_advice_tape(
     Ok(trace.advice_tape)
 }
 
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", not(feature = "akita")))]
 #[expect(
     clippy::too_many_arguments,
     reason = "SDK proof boundary mirrors guest inputs"
@@ -368,3 +377,63 @@ pub fn prove_program(
     )?;
     Ok((proof, public_io))
 }
+
+// Backend-neutral entry points used by `#[jolt::provable]`. The generated
+// code calls these instead of naming a commitment scheme, so the same macro
+// output works for Dory (default) and Akita (`akita` / `metal` features).
+
+#[cfg(all(feature = "host", not(feature = "akita")))]
+pub fn prover_preprocessing_from_shared(
+    shared: JoltSharedPreprocessing,
+) -> JoltProverPreprocessing {
+    jolt_prover::dory::from_shared(shared)
+}
+
+#[cfg(all(feature = "host", not(feature = "akita")))]
+pub fn verifier_preprocessing_from_parts(
+    shared: &JoltSharedPreprocessing,
+    generators: <PCS as CommitmentScheme>::VerifierSetup,
+    blindfold_setup: Option<BlindfoldSetup>,
+) -> JoltVerifierPreprocessing {
+    jolt_prover::dory::from_shared_parts(shared, generators, blindfold_setup)
+}
+
+#[cfg(all(feature = "host", not(feature = "akita")))]
+pub fn commit_trusted_advice(
+    preprocessing: &JoltProverPreprocessing,
+    advice_bytes: &[u8],
+) -> Result<(VerifierTrustedAdviceCommitment, TrustedAdviceOpeningHint), PreprocessingError> {
+    let committed = jolt_prover::dory::commit_trusted_advice(preprocessing, advice_bytes)?;
+    Ok((committed.commitment, committed.hint))
+}
+
+#[cfg(all(feature = "host", not(feature = "akita")))]
+pub fn prover_memory_layout(preprocessing: &JoltProverPreprocessing) -> &MemoryLayout {
+    preprocessing.verifier.program.memory_layout()
+}
+
+#[cfg(all(feature = "host", not(feature = "akita")))]
+pub fn verifier_memory_layout(preprocessing: &JoltVerifierPreprocessing) -> &MemoryLayout {
+    preprocessing.program.memory_layout()
+}
+
+#[cfg(all(feature = "host", not(feature = "akita")))]
+pub fn verify_program(
+    preprocessing: &JoltVerifierPreprocessing,
+    public_io: &JoltDevice,
+    proof: &RV64IMACProof,
+    trusted_advice_commitment: Option<&VerifierTrustedAdviceCommitment>,
+) -> Result<(), jolt_verifier::VerifierError> {
+    jolt_verifier::verify::<VerifierField, VerifierPCS, VerifierVC, VerifierTranscript>(
+        preprocessing,
+        public_io,
+        proof,
+        trusted_advice_commitment,
+    )
+}
+
+#[cfg(all(feature = "host", feature = "akita"))]
+#[path = "host_akita.rs"]
+mod host_akita;
+#[cfg(all(feature = "host", feature = "akita"))]
+pub use host_akita::*;

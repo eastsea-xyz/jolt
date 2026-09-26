@@ -260,7 +260,7 @@ impl MacroBuilder {
 
                 let verify_closure = move |#(#public_inputs,)* output, panic, #commitment_param_in_closure proof: jolt::RV64IMACProof| {
                     let preprocessing = (*preprocessing).clone();
-                    let memory_layout = preprocessing.program.memory_layout();
+                    let memory_layout = jolt::verifier_memory_layout(&preprocessing);
                     let memory_config = MemoryConfig {
                         max_input_size: memory_layout.max_input_size,
                         max_output_size: memory_layout.max_output_size,
@@ -276,17 +276,18 @@ impl MacroBuilder {
                     io_device.outputs.append(&mut jolt::postcard::to_stdvec(&output).unwrap());
                     io_device.panic = panic;
 
-                    jolt::jolt_verifier::verify::<
-                        jolt::VerifierField,
-                        jolt::VerifierPCS,
-                        jolt::VerifierVC,
-                        jolt::VerifierTranscript,
-                    >(
+                    match jolt::verify_program(
                         &preprocessing,
                         &io_device,
                         &proof,
                         #commitment_arg_in_verify,
-                    ).is_ok()
+                    ) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!("jolt proof verification failed: {error}");
+                            false
+                        }
+                    }
                 };
 
                 verify_closure
@@ -566,7 +567,7 @@ impl MacroBuilder {
                 -> jolt::JoltProverPreprocessing
             {
                 #imports
-                jolt::jolt_prover::dory::from_shared(shared_preprocessing)
+                jolt::prover_preprocessing_from_shared(shared_preprocessing)
             }
         }
     }
@@ -613,7 +614,7 @@ impl MacroBuilder {
                 blindfold_setup: Option<jolt::BlindfoldSetup>,
             ) -> jolt::JoltVerifierPreprocessing
             {
-                jolt::jolt_prover::dory::from_shared_parts(
+                jolt::verifier_preprocessing_from_parts(
                     &shared_preprocess,
                     generators,
                     blindfold_setup,
@@ -636,7 +637,7 @@ impl MacroBuilder {
                 -> jolt::JoltVerifierPreprocessing
             {
                 #imports
-                prover_preprocessing.verifier_preprocessing()
+                jolt::verifier_preprocessing_from_prover(prover_preprocessing)
             }
         }
     }
@@ -682,11 +683,11 @@ impl MacroBuilder {
                 #imports
                 let mut trusted_advice_bytes = vec![];
                 #(#set_trusted_advice_args;)*
-                let committed = jolt::jolt_prover::dory::commit_trusted_advice(
+                let (commitment, hint) = jolt::commit_trusted_advice(
                     preprocessing,
                     &trusted_advice_bytes,
                 ).expect("trusted advice fits the configured memory layout");
-                (Some(committed.commitment), Some(committed.hint))
+                (Some(commitment), Some(hint))
             }
         }
     }
@@ -701,7 +702,7 @@ impl MacroBuilder {
             ReturnType::Type(_, ty) => quote! {
                 let mut outputs = io_device.outputs.clone();
                 outputs.resize(
-                    preprocessing.verifier.program.memory_layout().max_output_size as usize,
+                    jolt::prover_memory_layout(&preprocessing).max_output_size as usize,
                     0,
                 );
                 let ret_val = jolt::postcard::from_bytes::<#ty>(&outputs).unwrap();
@@ -769,7 +770,7 @@ impl MacroBuilder {
                     &input_bytes,
                     &untrusted_advice_bytes,
                     &trusted_advice_bytes,
-                    preprocessing.verifier.program.memory_layout(),
+                    jolt::prover_memory_layout(&preprocessing),
                 ).expect("compute-advice execution should succeed");
                 let (jolt_proof, io_device) = jolt::prove_program(
                     program,
