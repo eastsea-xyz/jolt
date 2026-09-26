@@ -465,3 +465,17 @@ jolt-inlines-bigint = { path = "./jolt-inlines/bigint", default-features = false
 jolt-inlines-secp256k1 = { path = "./jolt-inlines/secp256k1", default-features = false }
 jolt-inlines-grumpkin = { path = "./jolt-inlines/grumpkin", default-features = false }
 jolt-inlines-p256 = { path = "./jolt-inlines/p256", default-features = false }
+
+# Aether: our akita branch (GPU-sized commit threadgroups), next to this checkout.
+[patch."https://github.com/markosg04/akita"]
+akita-algebra = { path = "../akita/crates/akita-algebra" }
+akita-config = { path = "../akita/crates/akita-config" }
+akita-error = { path = "../akita/crates/akita-error" }
+akita-metal = { path = "../akita/crates/akita-metal" }
+akita-pcs = { path = "../akita/crates/akita-pcs" }
+akita-prover = { path = "../akita/crates/akita-prover" }
+akita-planner = { path = "../akita/crates/akita-planner" }
+akita-schedules = { path = "../akita/crates/akita-schedules" }
+akita-challenges = { path = "../akita/crates/akita-challenges" }
+akita-transcript = { path = "../akita/crates/akita-transcript" }
+akita-types = { path = "../akita/crates/akita-types" }
