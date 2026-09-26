@@ -7,8 +7,9 @@ struct BooleanityRow {
 };
 
 #define BOOLEANITY_SOURCE_RAM_MASK 0xfffffffful
-#define BOOLEANITY_SOURCE_PC_MASK 0x3ffful
-#define BOOLEANITY_SOURCE_PC_SHIFT 32u
+// Metadata bits 32..=45 are reserved; pc_plus_one is source column 4.
+#define BOOLEANITY_SOURCE_PC_WORD 4u
+#define BOOLEANITY_SOURCE_PC_MASK 0x00ffFFFFFFFFFFFFul
 #define BOOLEANITY_SOURCE_RD_SHIFT 46u
 #define BOOLEANITY_SOURCE_RANK_SHIFT 54u
 #define BOOLEANITY_SOURCE_FUSED_SIGN_SHIFT 61u
@@ -40,7 +41,8 @@ inline ulong booleanity_row_word(
         return metadata & BOOLEANITY_SOURCE_RAM_MASK;
     }
     ulong pc_plus_one =
-        (metadata >> BOOLEANITY_SOURCE_PC_SHIFT) & BOOLEANITY_SOURCE_PC_MASK;
+        booleanity_source_word(rows, row_count, BOOLEANITY_SOURCE_PC_WORD, row)
+        & BOOLEANITY_SOURCE_PC_MASK;
     ulong rank = (metadata >> BOOLEANITY_SOURCE_RANK_SHIFT) & 0x7ful;
     ulong fused_negative =
         (metadata >> BOOLEANITY_SOURCE_FUSED_SIGN_SHIFT) & 1ul;

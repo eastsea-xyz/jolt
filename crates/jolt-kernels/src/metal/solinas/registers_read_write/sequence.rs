@@ -986,7 +986,7 @@ impl SolinasMetal {
                     .checked_mul(6 * size_of::<u64>())
                     .ok_or(MetalError::InputTooLong(cycles))?;
                 let expected_instruction_read_raf_bytes = cycles
-                    .checked_mul(4 * size_of::<u64>())
+                    .checked_mul(crate::metal::solinas::BOOLEANITY_SOURCE_ROW_BYTES)
                     .ok_or(MetalError::InputTooLong(cycles))?;
                 let expected_rd_index_bytes = cycles;
                 let expected_rd_post_bytes = cycles

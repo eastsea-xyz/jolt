@@ -1113,7 +1113,7 @@ mod tests {
                 .state::<InstructionReadRafStage1Owner>()
                 .unwrap()
                 .receipt();
-            assert_eq!(source_receipt.row_bytes(), 32 * (1 << log_t));
+            assert_eq!(source_receipt.row_bytes(), 40 * (1 << log_t));
             assert!(session
                 .state::<BytecodeAddressStage1TopologyOwner>()
                 .is_some());
