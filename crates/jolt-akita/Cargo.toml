@@ -12,6 +12,10 @@ workspace = true
 default = []
 metal = ["dep:akita-metal"]
 profiling = []
+# Compile the packaged schedules/*.aks into the binary and make the default
+# loader use them (ignoring JOLT_AKITA_SCHEDULE_DIR), so a shipped host binary
+# does not depend on this checkout's path at runtime.
+embedded-schedules = []
 
 [dependencies]
 # Jolt keeps its own catalogs for Jolt-specific trace shapes; Akita's shipped

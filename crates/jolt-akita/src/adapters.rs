@@ -51,8 +51,9 @@ pub const AKITA_ONE_HOT_K256: usize = 256;
 
 /// Runtime bytes for Jolt's three base schedule families.
 ///
-/// These bytes are ordinary input data. They are intentionally neither
-/// generated Rust nor embedded with `include_bytes!`.
+/// These bytes are ordinary input data. They are intentionally not generated
+/// Rust, and are embedded with `include_bytes!` only under the opt-in
+/// `embedded-schedules` feature (for self-contained host binaries).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AkitaScheduleArtifacts {
@@ -103,10 +104,30 @@ impl AkitaScheduleArtifacts {
     /// Loads from `JOLT_AKITA_SCHEDULE_DIR`, or from the packaged `schedules/`
     /// directory when the variable is unset. Protocol setup and verification
     /// never consult the environment.
+    ///
+    /// With the `embedded-schedules` feature, returns the packaged artifacts
+    /// compiled into the binary instead, and never consults the environment.
     fn from_default_directory() -> Result<Self, OpeningsError> {
-        let directory = std::env::var_os(Self::DIRECTORY_ENV)
-            .map_or_else(Self::packaged_directory, PathBuf::from);
-        Self::from_directory(directory)
+        #[cfg(feature = "embedded-schedules")]
+        {
+            Ok(Self::embedded())
+        }
+        #[cfg(not(feature = "embedded-schedules"))]
+        {
+            let directory = std::env::var_os(Self::DIRECTORY_ENV)
+                .map_or_else(Self::packaged_directory, PathBuf::from);
+            Self::from_directory(directory)
+        }
+    }
+
+    /// The packaged `schedules/` artifacts, compiled in.
+    #[cfg(feature = "embedded-schedules")]
+    pub fn embedded() -> Self {
+        Self::new(
+            include_bytes!("../schedules/jolt-fp128-dense-bounded.aks").to_vec(),
+            include_bytes!("../schedules/jolt-fp128-onehot-k16.aks").to_vec(),
+            include_bytes!("../schedules/jolt-fp128-onehot-k256.aks").to_vec(),
+        )
     }
 
     /// Host/dev loader in the shared-handle form every setup call takes: the

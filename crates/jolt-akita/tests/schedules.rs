@@ -338,3 +338,11 @@ fn catalogs_match_planner_regeneration() {
     }
     std::fs::remove_dir_all(output).expect("remove temporary artifacts");
 }
+
+/// The compiled-in schedules are byte-identical to the packaged directory
+/// (and their file names match the family names the directory loader uses).
+#[cfg(feature = "embedded-schedules")]
+#[test]
+fn embedded_schedules_match_the_packaged_directory() {
+    assert_eq!(AkitaScheduleArtifacts::embedded(), artifacts());
+}
