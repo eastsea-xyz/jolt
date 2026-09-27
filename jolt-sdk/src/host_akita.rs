@@ -377,13 +377,22 @@ pub fn verify_program(
         )
         .into());
     }
-    let config = ProverConfig {
-        trace_length: proof.trace_length,
-        ram_K: proof.ram_K,
-        rw_config: proof.rw_config,
-        one_hot_config: proof.one_hot_config,
-        trace_polynomial_order: proof.trace_polynomial_order,
-    };
+    if !proof.ram_K.is_power_of_two() {
+        return Err(IoError::new(ErrorKind::InvalidData, "proof RAM size is not a power of two").into());
+    }
+    // Only the configuration the prover derives for this shape is accepted:
+    // the setup (and its cache entry) then follows from the shape alone.
+    let config = ProverConfig::for_shape(proof.trace_length, proof.ram_K);
+    if proof.rw_config != config.rw_config
+        || proof.one_hot_config != config.one_hot_config
+        || proof.trace_polynomial_order != config.trace_polynomial_order
+    {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "proof declares a chunking configuration other than the canonical one for its shape",
+        )
+        .into());
+    }
     let setup = preprocessing.setup_for(
         &config,
         proof.untrusted_advice_commitment.is_some(),

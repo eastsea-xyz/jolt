@@ -145,14 +145,23 @@ impl ProverConfig {
             + 1;
         let ram_K = touched.max(image_end).next_power_of_two() as usize;
 
+        Ok(Self::for_shape(trace_length, ram_K))
+    }
+
+    /// The configuration `derive` picks for a padded trace length and RAM size
+    /// (both powers of two). A verifier rebuilds it from a proof's shape and
+    /// refuses proofs that declare anything else, so the declared chunking can
+    /// neither vary nor key a setup cache differently.
+    #[expect(non_snake_case)]
+    pub fn for_shape(trace_length: usize, ram_K: usize) -> Self {
         let log_T = trace_length.ilog2() as usize;
-        Ok(Self {
+        Self {
             trace_length,
             ram_K,
             rw_config: read_write_config(log_T, ram_K.ilog2() as usize),
             one_hot_config: one_hot_config(log_T),
             trace_polynomial_order: TracePolynomialOrder::CycleMajor,
-        })
+        }
     }
 
     /// The shared commitment-embedding variable count: the one-hot main matrix
