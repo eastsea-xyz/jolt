@@ -661,30 +661,88 @@ impl AkitaVerifierSetup {
         Ok(cache.get_or_init(|| verifier))
     }
 
+    /// Derives the backend verifier key for `flavor` without the prover
+    /// setup: see [`crate::AkitaScheme::verifier_setup_only`].
     fn build_backend_verifier(
         &self,
         flavor: AkitaBackendFlavor,
     ) -> Result<AkitaBackendVerifier, OpeningsError> {
+        let known = crate::setup_prefixes::shipped()?;
         match flavor {
             AkitaBackendFlavor::Dense => {
                 let scheme = self.dense_scheme()?;
-                let prover_setup = with_backend_pool(|| {
-                    scheme.setup_prover(self.max_num_vars, self.max_total_batch_polys)
+                with_backend_pool(|| {
+                    scheme.setup_verifier_only(self.max_num_vars, self.max_total_batch_polys, known)
                 })
-                .map_err(invalid_setup)?;
-                with_backend_pool(|| scheme.setup_verifier(&prover_setup)).map_err(invalid_setup)
+                .map_err(invalid_setup)
             }
             AkitaBackendFlavor::OneHot => {
                 let log_k = validate_one_hot_k(self.one_hot_k)?;
                 if self.max_num_vars < log_k {
                     return Err(invalid_batch("Akita verifier setup has no one-hot backend"));
                 }
-                let prover_setup =
-                    one_hot_setup_prover(self, self.max_num_vars, self.max_total_batch_polys)
-                        .map_err(invalid_setup)?;
-                one_hot_setup_verifier(self, &prover_setup)
+                let (max_vars, max_polys) = (self.max_num_vars, self.max_total_batch_polys);
+                let derived = match self.one_hot_k {
+                    AKITA_ONE_HOT_K16 => {
+                        let scheme = self.one_hot_k16_scheme()?;
+                        with_backend_pool(|| scheme.setup_verifier_only(max_vars, max_polys, known))
+                    }
+                    AKITA_ONE_HOT_K256 => {
+                        let scheme = self.one_hot_k256_scheme()?;
+                        with_backend_pool(|| scheme.setup_verifier_only(max_vars, max_polys, known))
+                    }
+                    other => {
+                        return Err(invalid_batch(format!(
+                            "unsupported Akita one-hot K={other}"
+                        )))
+                    }
+                };
+                derived.map_err(invalid_setup)
             }
         }
+    }
+
+    /// Setup-prefix slots the `flavor` backend verifier key requires.
+    pub(crate) fn required_setup_prefix_slots(
+        &self,
+        flavor: AkitaBackendFlavor,
+    ) -> Result<Vec<akita_types::SetupPrefixSlotId>, OpeningsError> {
+        let (max_vars, max_polys) = (self.max_num_vars, self.max_total_batch_polys);
+        let ids = match flavor {
+            AkitaBackendFlavor::Dense => akita_pcs::verifier_setup::required_setup_prefix_slot_ids(
+                self.dense_scheme()?.schedules(),
+                max_vars,
+                max_polys,
+            ),
+            AkitaBackendFlavor::OneHot => match self.one_hot_k {
+                AKITA_ONE_HOT_K16 => akita_pcs::verifier_setup::required_setup_prefix_slot_ids(
+                    self.one_hot_k16_scheme()?.schedules(),
+                    max_vars,
+                    max_polys,
+                ),
+                AKITA_ONE_HOT_K256 => akita_pcs::verifier_setup::required_setup_prefix_slot_ids(
+                    self.one_hot_k256_scheme()?.schedules(),
+                    max_vars,
+                    max_polys,
+                ),
+                other => {
+                    return Err(invalid_batch(format!(
+                        "unsupported Akita one-hot K={other}"
+                    )))
+                }
+            },
+        };
+        ids.map_err(invalid_setup)
+    }
+
+    /// The backend verifier key for `flavor` (derived on first use), exposed
+    /// so tests can compare keys derived by different setup paths.
+    #[doc(hidden)]
+    pub fn backend_verifier_key(
+        &self,
+        flavor: AkitaBackendFlavor,
+    ) -> Result<&AkitaBackendVerifierSetup<AkitaField>, OpeningsError> {
+        self.backend_verifier(flavor)
     }
 }
 

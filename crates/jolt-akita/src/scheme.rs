@@ -774,17 +774,13 @@ impl Commitment for AkitaScheme {
     type Output = AkitaCommitment;
 }
 
-impl CommitmentScheme for AkitaScheme {
-    type Field = AkitaField;
-    type Proof = AkitaBatchProof;
-    type ProverSetup = AkitaProverSetup;
-    type VerifierSetup = AkitaVerifierSetup;
-    type OpeningHint = AkitaProverHint;
-    type SetupParams = AkitaSetupParams;
-
-    fn setup(
-        params: Self::SetupParams,
-    ) -> Result<(Self::ProverSetup, Self::VerifierSetup), OpeningsError> {
+impl AkitaScheme {
+    /// The verifier setup for `params` without any backend key: the exact
+    /// setup-owned schedule catalogs plus the shape metadata. Cheap (no public
+    /// matrix); backend keys are derived from it on demand.
+    fn verifier_setup_shell(
+        params: &AkitaSetupParams,
+    ) -> Result<AkitaVerifierSetup, OpeningsError> {
         if params
             .precommitted_schedule
             .as_ref()
@@ -825,7 +821,7 @@ impl CommitmentScheme for AkitaScheme {
                 dense: dense_schedule_artifact()?,
             },
         };
-        let one_hot_log_k = validate_one_hot_k(params.one_hot_k)
+        let _ = validate_one_hot_k(params.one_hot_k)
             .map_err(|err| OpeningsError::InvalidSetup(err.to_string()))?;
         let verifier = AkitaVerifierSetup {
             max_num_vars: params.max_num_vars,
@@ -836,6 +832,70 @@ impl CommitmentScheme for AkitaScheme {
             schedule_artifacts,
             backend_cache: BackendVerifierCache::default(),
         };
+        Ok(verifier)
+    }
+
+    /// Verifier setup for `params`, derived without building the prover setup.
+    ///
+    /// [`CommitmentScheme::setup`] builds the prover's backend setups (the
+    /// whole public matrix plus its setup-prefix commitments) and hands the
+    /// verifier keys cut from them. This derives each backend verifier key
+    /// directly: only the public-matrix prefix verification reads is
+    /// materialized, and setup-prefix commitments come from the shipped
+    /// registry ([`crate::setup_prefixes`]), falling back to deriving any
+    /// missing one. The result equals the verifier half of
+    /// [`CommitmentScheme::setup`] narrowed to the verifier's matrix
+    /// capacity; proofs verify identically against either.
+    pub fn verifier_setup_only(
+        params: &AkitaSetupParams,
+    ) -> Result<AkitaVerifierSetup, OpeningsError> {
+        let verifier = Self::verifier_setup_shell(params)?;
+        let one_hot_log_k = validate_one_hot_k(params.one_hot_k)
+            .map_err(|err| OpeningsError::InvalidSetup(err.to_string()))?;
+        if params.flavor != AkitaSetupFlavor::OneHot {
+            let _ = verifier.backend_verifier(AkitaBackendFlavor::Dense)?;
+        }
+        if params.max_num_vars >= one_hot_log_k && params.flavor != AkitaSetupFlavor::Dense {
+            let _ = verifier.backend_verifier(AkitaBackendFlavor::OneHot)?;
+        }
+        Ok(verifier)
+    }
+
+    /// Setup-prefix slots the backend verifier keys of `params` require, in
+    /// canonical order (dense flavor first). This is what the shipped
+    /// registry must cover for [`Self::verifier_setup_only`] to derive no
+    /// commitment itself.
+    pub fn required_setup_prefix_slots(
+        params: &AkitaSetupParams,
+    ) -> Result<Vec<akita_types::SetupPrefixSlotId>, OpeningsError> {
+        let verifier = Self::verifier_setup_shell(params)?;
+        let one_hot_log_k = validate_one_hot_k(params.one_hot_k)
+            .map_err(|err| OpeningsError::InvalidSetup(err.to_string()))?;
+        let mut ids = Vec::new();
+        if params.flavor != AkitaSetupFlavor::OneHot {
+            ids.extend(verifier.required_setup_prefix_slots(AkitaBackendFlavor::Dense)?);
+        }
+        if params.max_num_vars >= one_hot_log_k && params.flavor != AkitaSetupFlavor::Dense {
+            ids.extend(verifier.required_setup_prefix_slots(AkitaBackendFlavor::OneHot)?);
+        }
+        Ok(ids)
+    }
+}
+
+impl CommitmentScheme for AkitaScheme {
+    type Field = AkitaField;
+    type Proof = AkitaBatchProof;
+    type ProverSetup = AkitaProverSetup;
+    type VerifierSetup = AkitaVerifierSetup;
+    type OpeningHint = AkitaProverHint;
+    type SetupParams = AkitaSetupParams;
+
+    fn setup(
+        params: Self::SetupParams,
+    ) -> Result<(Self::ProverSetup, Self::VerifierSetup), OpeningsError> {
+        let verifier = Self::verifier_setup_shell(&params)?;
+        let one_hot_log_k = validate_one_hot_k(params.one_hot_k)
+            .map_err(|err| OpeningsError::InvalidSetup(err.to_string()))?;
         let (backend_prover_setup, prepared_backend_setup, backend_verifier_setup) =
             if params.flavor == AkitaSetupFlavor::OneHot {
                 (None, None, None)

@@ -11,7 +11,10 @@
 //! cache of per-shape setups: the prover builds the setup for the shape it
 //! derived from the trace, and the verifier builds (or reuses) the setup for
 //! the shape the proof declares. Akita setups are transparent, so both sides
-//! derive the same setup from the same shape.
+//! derive the same setup from the same shape. The verifier derives only its
+//! own half ([`verifier_preprocess_full_with_advice`]): the public-matrix
+//! prefix verification reads plus the shipped setup-prefix commitments, never
+//! the prover's matrix.
 
 use std::{
     cell::RefCell,
@@ -23,7 +26,8 @@ use std::{
 };
 
 use jolt_prover::akita::preprocessing::{
-    preprocess_committed_with_advice, preprocess_full_with_advice, AkitaProverPreprocessing,
+    preprocess_committed_with_advice, preprocess_full_with_advice,
+    verifier_preprocess_full_with_advice, AkitaProverPreprocessing, AkitaVerifierPreprocessing,
 };
 use jolt_prover::akita::JoltAkitaBackend;
 use jolt_prover::ProverConfig;
@@ -64,12 +68,14 @@ struct ShapeKey {
 }
 
 type SetupCache = Mutex<HashMap<ShapeKey, Arc<AkitaProverPreprocessing>>>;
+type VerifierSetupCache = Mutex<HashMap<ShapeKey, Arc<AkitaVerifierPreprocessing>>>;
 
 #[derive(Clone)]
 pub struct AkitaPreprocessing {
     pub shared: JoltSharedPreprocessing,
     pub bytecode_chunk_count: Option<usize>,
     setups: Arc<SetupCache>,
+    verifier_setups: Arc<VerifierSetupCache>,
 }
 
 impl AkitaPreprocessing {
@@ -78,6 +84,7 @@ impl AkitaPreprocessing {
             shared,
             bytecode_chunk_count,
             setups: Arc::default(),
+            verifier_setups: Arc::default(),
         }
     }
 
@@ -117,6 +124,65 @@ impl AkitaPreprocessing {
         let setup = Arc::new(setup);
         let _ = setups.insert(key, Arc::clone(&setup));
         Ok(setup)
+    }
+}
+
+impl AkitaPreprocessing {
+    /// The verifier preprocessing for one proof shape, built on first use and
+    /// cached.
+    ///
+    /// A shape this preprocessing already proved reuses the prover's verifier
+    /// half. Otherwise a full program derives only the verifier setup
+    /// ([`verifier_preprocess_full_with_advice`]), which never materializes
+    /// the prover's public matrix. A committed program still goes through
+    /// [`Self::setup_for`]: its verifier needs the program commitments, which
+    /// only the prover path computes.
+    pub fn verifier_setup_for(
+        &self,
+        config: &ProverConfig,
+        untrusted_advice: bool,
+        trusted_advice: bool,
+    ) -> Result<Arc<AkitaVerifierPreprocessing>, PreprocessingError> {
+        let key = ShapeKey {
+            trace_length: config.trace_length,
+            ram_k: config.ram_K,
+            untrusted_advice,
+            trusted_advice,
+        };
+        let mut verifiers = self
+            .verifier_setups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(verifier) = verifiers.get(&key) {
+            return Ok(Arc::clone(verifier));
+        }
+        let proved = self
+            .setups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .map(Arc::clone);
+        let verifier = match (proved, self.bytecode_chunk_count) {
+            (Some(setup), _) => setup.verifier.clone(),
+            (None, Some(_)) => {
+                drop(verifiers);
+                let setup = self.setup_for(config, untrusted_advice, trusted_advice)?;
+                verifiers = self
+                    .verifier_setups
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                setup.verifier.clone()
+            }
+            (None, None) => verifier_preprocess_full_with_advice(
+                (*self.shared.program).clone(),
+                config,
+                untrusted_advice,
+                trusted_advice,
+            )?,
+        };
+        let verifier = Arc::new(verifier);
+        let _ = verifiers.insert(key, Arc::clone(&verifier));
+        Ok(verifier)
     }
 }
 
@@ -378,7 +444,11 @@ pub fn verify_program(
         .into());
     }
     if !proof.ram_K.is_power_of_two() {
-        return Err(IoError::new(ErrorKind::InvalidData, "proof RAM size is not a power of two").into());
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "proof RAM size is not a power of two",
+        )
+        .into());
     }
     // Only the configuration the prover derives for this shape is accepted:
     // the setup (and its cache entry) then follows from the shape alone.
@@ -393,13 +463,13 @@ pub fn verify_program(
         )
         .into());
     }
-    let setup = preprocessing.setup_for(
+    let verifier = preprocessing.verifier_setup_for(
         &config,
         proof.untrusted_advice_commitment.is_some(),
         trusted_advice_commitment.is_some(),
     )?;
     jolt_verifier::verify::<VerifierField, VerifierPCS, VerifierVC, VerifierTranscript>(
-        &setup.verifier,
+        &verifier,
         public_io,
         proof,
         trusted_advice_commitment,

@@ -3693,6 +3693,7 @@ dependencies = [
 name = "jolt-prover"
 version = "0.1.0"
 dependencies = [
+ "akita-types",
  "allocative",
  "ark-serialize 0.5.0",
  "bincode 2.0.1",

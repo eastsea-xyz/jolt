@@ -252,6 +252,59 @@ mod akita_tests {
         }
     }
 
+    /// A real proof verifies against a verifier preprocessing derived by the
+    /// verifier-only path (no prover setup), which matches the prover's
+    /// verifier preprocessing and still rejects tampering.
+    #[test]
+    fn proofs_verify_through_verifier_only_setup() {
+        let muldiv = muldiv_run();
+        let untrusted = postcard::to_stdvec(&5u64).expect("serialize untrusted advice");
+        let inputs = postcard::to_stdvec(&5u64).expect("serialize inputs");
+        let advice_run = guest_run("advice-consumer-guest", &inputs, &untrusted, &[]);
+        let advice_config = derive_config(&advice_run);
+        for ((run, config), untrusted_advice) in
+            [(muldiv, false), ((advice_run, advice_config), true)]
+        {
+            let program = run.preprocessing.clone();
+            let proved = prove_guest(run, config, untrusted_advice, &[]);
+            let verifier = preprocessing::verifier_preprocess_full_with_advice(
+                program,
+                &config,
+                untrusted_advice,
+                false,
+            )
+            .expect("verifier-only preprocessing");
+            assert_eq!(
+                verifier.preprocessing_digest,
+                proved.preprocessing.verifier.preprocessing_digest
+            );
+            assert_eq!(verifier.pcs_setup, proved.preprocessing.verifier.pcs_setup);
+            jolt_verifier::verify::<AkitaField, AkitaScheme, AkitaVc, AkitaTranscript>(
+                &verifier,
+                &proved.public_io,
+                &proved.proof,
+                None,
+            )
+            .expect("proof must verify through the verifier-only setup");
+
+            let mut tampered = proved.proof.clone();
+            let JoltProofClaims::Clear(claims) = &mut tampered.claims else {
+                panic!("Akita proofs carry clear claims");
+            };
+            claims.stage6b.bytecode_read_raf.fused_inc += AkitaField::from_u64(1);
+            assert!(
+                jolt_verifier::verify::<AkitaField, AkitaScheme, AkitaVc, AkitaTranscript>(
+                    &verifier,
+                    &proved.public_io,
+                    &tampered,
+                    None,
+                )
+                .is_err(),
+                "tampered proof must be rejected by the verifier-only setup"
+            );
+        }
+    }
+
     #[test]
     fn muldiv_e2e_akita_forced_k256() {
         let (run, mut config) = muldiv_run();

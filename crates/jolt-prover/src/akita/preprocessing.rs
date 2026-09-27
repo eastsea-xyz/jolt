@@ -61,6 +61,31 @@ pub fn preprocess_full_with_advice(
     })
 }
 
+/// Verifier preprocessing for one proof shape of a full (uncommitted)
+/// program, derived without the prover setup.
+///
+/// Equal to the `verifier` half of [`preprocess_full_with_advice`] for the
+/// same inputs, except that its backend verifier key holds only the
+/// public-matrix prefix verification reads
+/// ([`AkitaScheme::verifier_setup_only`]); proofs verify identically.
+pub fn verifier_preprocess_full_with_advice(
+    program: JoltProgramPreprocessing,
+    config: &ProverConfig,
+    untrusted_advice: bool,
+    trusted_advice: bool,
+) -> Result<AkitaVerifierPreprocessing, PreprocessingError> {
+    validate_trace_order(config)?;
+    let params = grouped_setup_params(&program, config, untrusted_advice, trusted_advice, &[])?;
+    let verifier_setup = AkitaScheme::verifier_setup_only(&params)?;
+    let preprocessing_digest = full_preprocessing_digest(&program)?;
+    Ok(JoltVerifierPreprocessing::new(
+        ProgramPreprocessing::Full(Arc::new(program)),
+        preprocessing_digest,
+        verifier_setup,
+        None,
+    ))
+}
+
 /// The grouped packed setup: the canonical `OneHotTrace` object plus every
 /// precommitted object (advice, then direct program objects) opened in one
 /// batch. Building it provisions the grouped schedule rows that commit,
@@ -72,18 +97,54 @@ fn grouped_setup(
     trusted_advice: bool,
     direct_program_physical_vars: &[usize],
 ) -> Result<(AkitaProverSetup, AkitaVerifierSetup), PreprocessingError> {
-    let (shape, layout_digest, one_hot_k) =
-        one_hot_trace_setup_shape(config, program.bytecode.code_size).map_err(|error| {
-            PreprocessingError::InvalidConfiguration {
-                reason: error.to_string(),
-            }
-        })?;
+    let params = grouped_setup_params(
+        program,
+        config,
+        untrusted_advice,
+        trusted_advice,
+        direct_program_physical_vars,
+    )?;
+    Ok(AkitaScheme::setup(params)?)
+}
+
+/// The grouped packed setup parameters for one proof shape (see
+/// [`grouped_setup`]).
+pub fn grouped_setup_params(
+    program: &JoltProgramPreprocessing,
+    config: &ProverConfig,
+    untrusted_advice: bool,
+    trusted_advice: bool,
+    direct_program_physical_vars: &[usize],
+) -> Result<AkitaSetupParams, PreprocessingError> {
     let untrusted_physical_vars = untrusted_advice
         .then(|| advice_physical_num_vars(program, JoltAdviceKind::Untrusted))
         .transpose()?;
     let trusted_physical_vars = trusted_advice
         .then(|| advice_physical_num_vars(program, JoltAdviceKind::Trusted))
         .transpose()?;
+    grouped_setup_params_for_shape(
+        config,
+        program.bytecode.code_size,
+        untrusted_physical_vars,
+        trusted_physical_vars,
+        direct_program_physical_vars,
+    )
+}
+
+/// [`grouped_setup_params`] from the shape inputs alone: the proof config,
+/// the program's bytecode length, and the physical arity of each
+/// precommitted object present (see [`advice_physical_num_vars_for_bytes`]).
+pub fn grouped_setup_params_for_shape(
+    config: &ProverConfig,
+    bytecode_len: usize,
+    untrusted_physical_vars: Option<usize>,
+    trusted_physical_vars: Option<usize>,
+    direct_program_physical_vars: &[usize],
+) -> Result<AkitaSetupParams, PreprocessingError> {
+    let (shape, layout_digest, one_hot_k) = one_hot_trace_setup_shape(config, bytecode_len)
+        .map_err(|error| PreprocessingError::InvalidConfiguration {
+            reason: error.to_string(),
+        })?;
     let precommitted_count = usize::from(untrusted_physical_vars.is_some())
         + usize::from(trusted_physical_vars.is_some())
         + direct_program_physical_vars.len();
@@ -104,7 +165,7 @@ fn grouped_setup(
         precommitted_schedule,
         AkitaScheduleArtifacts::shared_from_default_directory(),
     );
-    Ok(AkitaScheme::setup(params)?)
+    Ok(params)
 }
 
 pub fn preprocess_committed(
@@ -256,6 +317,14 @@ fn advice_physical_num_vars(
     let max_bytes = usize::try_from(max_bytes).map_err(|_| PreprocessingError::InvalidAdvice {
         reason: "advice size does not fit usize".to_owned(),
     })?;
+    advice_physical_num_vars_for_bytes(kind, max_bytes)
+}
+
+/// The physical arity of an advice object with capacity `max_bytes`.
+pub fn advice_physical_num_vars_for_bytes(
+    kind: JoltAdviceKind,
+    max_bytes: usize,
+) -> Result<usize, PreprocessingError> {
     let word_vars = (max_bytes / 8).next_power_of_two().ilog2() as usize;
     advice_packing_plan(kind, word_vars)
         .map(|plan| plan.packing().packed_num_vars())

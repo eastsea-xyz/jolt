@@ -114,6 +114,8 @@ serde = { workspace = true, features = ["derive"] }
 tracer = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Verifier-only setup tests compare backend verifier keys field by field.
+akita-types.workspace = true
 bincode.workspace = true
 clap.workspace = true
 jolt-dory.workspace = true
@@ -126,6 +128,12 @@ postcard = { workspace = true, features = ["use-std"] }
 rand_core = { workspace = true, features = ["getrandom"] }
 serde_json = { workspace = true, features = ["std"] }
 tracer.workspace = true
+
+# Offline generator for jolt-akita's shipped setup-prefix commitments.
+[[bin]]
+name = "gen_akita_setup_prefixes"
+path = "src/bin/gen_akita_setup_prefixes.rs"
+required-features = ["akita"]
 
 [[bin]]
 name = "jolt-prover"

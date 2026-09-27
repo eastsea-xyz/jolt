@@ -27,6 +27,7 @@ mod planning;
 pub mod schedule_registry;
 pub mod schedules;
 mod scheme;
+pub mod setup_prefixes;
 mod shape_guard;
 mod trace_onehot;
 
