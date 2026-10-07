@@ -874,6 +874,7 @@ impl InstructionClaimSequence {
                 self.buffers.partial_b.clone()
             };
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok(InstructionClaimInitialMessageCommand {
                 command_buffer,
                 output,
@@ -1587,6 +1588,7 @@ fn finish_command_vec(
     label: &'static str,
 ) -> Result<(Vec<AkitaField>, Duration), MetalError> {
     command_buffer.commit();
+    crate::metal::profiling::record_submission(command_buffer);
     command_buffer.wait_until_completed();
     let gpu_active = completed_command_gpu_time(command_buffer)?;
     let values = unsafe {

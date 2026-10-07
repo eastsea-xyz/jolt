@@ -492,7 +492,7 @@ pub(super) fn command_buffer_timestamp(
     })
 }
 
-pub(super) fn completed_command_gpu_time(
+pub(crate) fn completed_command_gpu_time(
     command_buffer: &metal::CommandBufferRef,
 ) -> Result<Duration, MetalError> {
     validate_completed_command(command_buffer)?;

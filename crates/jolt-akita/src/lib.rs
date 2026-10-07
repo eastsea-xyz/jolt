@@ -51,6 +51,9 @@ pub use schedule_registry::PrecommittedScheduleParams;
 pub use scheme::{AkitaScheme, TraceCommitmentBackend, TraceOneHotCommitment};
 pub use trace_onehot::{no_selected_row, TraceOneHotRows, TracePackedOneHot, TracePackedSelectors};
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use akita_metal::profiling as metal_profiling;
+
 /// Jolt↔Akita basis-order bridging, exposed so benchmarks measuring the raw
 /// backend use the exact transform the adapter uses.
 #[doc(hidden)]

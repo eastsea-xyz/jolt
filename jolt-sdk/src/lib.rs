@@ -151,6 +151,9 @@ pub use jolt_verifier;
 #[cfg(feature = "host")]
 pub use jolt_prover;
 
+#[cfg(feature = "host")]
+pub use jolt_prover::telemetry as proof_profile;
+
 #[cfg(any(feature = "host", feature = "guest-verifier"))]
 pub use host_utils::*;
 

@@ -385,6 +385,7 @@ impl RamRaClaimReductionSequence {
                 encoder.end_encoding();
             }
             command.commit();
+            crate::metal::profiling::record_submission(&command);
         });
         let wait_started = Instant::now();
         command.wait_until_completed();
@@ -462,6 +463,7 @@ impl RamRaClaimReductionSequence {
             );
             encoder.end_encoding();
             command.commit();
+            crate::metal::profiling::record_submission(&command);
         });
         command.wait_until_completed();
         let gpu_active = completed_command_gpu_time(&command)?;

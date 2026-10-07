@@ -26,6 +26,7 @@ use crate::stages::stage5::prove_stage5;
 use crate::stages::stage6a::prove_stage6a;
 use crate::stages::stage6b::prove_stage6b;
 use crate::stages::stage7::prove_stage7;
+use crate::telemetry;
 use crate::{JoltProverPreprocessing, ProofMode, ProverConfig, ProverError};
 
 /// See [`super::prove`].
@@ -48,6 +49,7 @@ where
     T: Transcript<Challenge = F>,
     W: JoltWitnessPlane<F> + Sync,
 {
+    let _profile = telemetry::stage("prover.akita");
     // The packed path is transparent-only (`akita` and `zk` are mutually
     // exclusive), so the mode context carries nothing; the shared stage
     // recipes still thread it to mint their clear recorders.
@@ -73,19 +75,23 @@ where
                 complete = tracing::field::Empty,
             );
             let _entered = span.enter();
+            let _profile = telemetry::asynchronous_stage("witness.backend_prepare_async");
             let result = prepare_kernel.prepare_witness(prepare_session, log_t, witness);
             let _ = span.record("complete", result.is_ok());
             result.map_err(ProverError::from)
         });
-        let stage0 = prove_stage0::<F, PCS, VC, T, W>(
-            backend,
-            preprocessing,
-            config,
-            trusted_advice,
-            witness,
-            public_io,
-            Some(&rows_ready_sender),
-        );
+        let stage0 = {
+            let _profile = telemetry::stage("stage0.commitments");
+            prove_stage0::<F, PCS, VC, T, W>(
+                backend,
+                preprocessing,
+                config,
+                trusted_advice,
+                witness,
+                public_io,
+                Some(&rows_ready_sender),
+            )
+        };
         drop(rows_ready_sender);
         let completed_before_join = prepare.is_finished();
         let _span = tracing::info_span!(
@@ -93,12 +99,16 @@ where
             completed_before_join
         )
         .entered();
-        let witness_prepare = prepare
-            .join()
-            .map_err(|_| ProverError::InvariantViolation {
-                reason: "asynchronous backend witness preparation panicked",
-            })
-            .and_then(|result| result);
+        let witness_prepare = {
+            let profile = telemetry::stage("witness.backend_prepare_join");
+            profile.metadata("completed_before_join", completed_before_join.to_string());
+            prepare
+                .join()
+                .map_err(|_| ProverError::InvariantViolation {
+                    reason: "asynchronous backend witness preparation panicked",
+                })
+                .and_then(|result| result)
+        };
         (stage0, witness_prepare)
     });
     let stage0 = stage0?;
@@ -106,6 +116,7 @@ where
     let checked = stage0.checked;
     let mut transcript = stage0.transcript;
 
+    let profile = telemetry::stage("sumcheck.stage1");
     let stage1 = prove_stage1::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -114,6 +125,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage2");
     let stage2 = prove_stage2::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -124,6 +137,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage3");
     let stage3 = prove_stage3::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -134,6 +149,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage4");
     let stage4 = prove_stage4::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -146,6 +163,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage5");
     let stage5 = prove_stage5::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -158,6 +177,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage6a");
     let stage6a = prove_stage6a::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -173,6 +194,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage6b");
     let stage6b = prove_stage6b::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -189,6 +212,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("sumcheck.stage7");
     let stage7 = prove_stage7::<F, PCS, VC, T>(
         &backend.base,
         &mut session,
@@ -201,6 +226,8 @@ where
         witness,
         &mut transcript,
     )?;
+    drop(profile);
+    let profile = telemetry::stage("opening.stage8");
     let joint_opening_proof = prove_stage8::<F, PCS, VC, T>(
         &checked,
         config,
@@ -218,6 +245,7 @@ where
         &stage7.clear_output,
         &mut transcript,
     )?;
+    drop(profile);
 
     Ok(JoltProof {
         protocol: JoltProtocolConfig::for_zk(false),

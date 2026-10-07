@@ -454,6 +454,7 @@ impl RamHammingSequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
@@ -516,6 +517,7 @@ impl RamHammingSequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;

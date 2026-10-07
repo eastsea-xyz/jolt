@@ -721,6 +721,7 @@ impl RegistersValFirstMessageInvocation {
             );
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
         });
         RegistersValFirstMessageCommand { command_buffer }
     }
@@ -876,6 +877,7 @@ impl RegistersValFirstTransitionInvocation {
             );
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             let gpu_active = completed_command_gpu_time(command_buffer)?;
             self.completed.set(true);
@@ -1038,6 +1040,7 @@ impl RegistersValSequence {
             );
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             let gpu_active = completed_command_gpu_time(command_buffer)?;
             let final_buffer = if self.final_in_a {

@@ -299,6 +299,7 @@ impl ProductInstructionRoundService {
             encoder.end_encoding();
             let (product_output, instruction_output) = encoded?;
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok::<_, MetalError>((product_output, instruction_output, command_buffer))
         })?;
         command_buffer.wait_until_completed();
@@ -675,6 +676,7 @@ impl SolinasMetal {
             encoder.end_encoding();
             let (product_output, instruction_output) = encoded?;
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok(PendingProductInstructionInitialMessage {
                 product: Some(product),
                 instruction: Some(instruction),

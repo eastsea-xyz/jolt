@@ -1667,6 +1667,7 @@ impl ProductRemainderSequence {
             );
             encoder.end_encoding();
             command.commit();
+            crate::metal::profiling::record_submission(&command);
             command
         })
     }
@@ -1700,6 +1701,7 @@ impl ProductRemainderSequence {
             }
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         validate_completed_command(command_buffer)
@@ -1976,6 +1978,7 @@ impl ProductRemainderSequence {
                 self.buffers.partial_b.clone()
             };
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             let state_b_fill = self.submit_state_b_fill();
             Ok(ProductRemainderInitialMessageCommand {
                 command_buffer,
@@ -2456,6 +2459,7 @@ fn finish_product_remainder_command<const COLUMNS: usize>(
     label: &'static str,
 ) -> Result<([AkitaField; COLUMNS], Duration), MetalError> {
     command_buffer.commit();
+    crate::metal::profiling::record_submission(command_buffer);
     command_buffer.wait_until_completed();
     let gpu_active = completed_command_gpu_time(command_buffer)?;
     // SAFETY: the completed recursive reduction leaves `COLUMNS` fields at

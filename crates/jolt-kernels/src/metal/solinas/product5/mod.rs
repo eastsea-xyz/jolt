@@ -494,6 +494,7 @@ impl Product5Sequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             validate_completed_command(command_buffer)?;
             let final_buffer = if final_in_a {

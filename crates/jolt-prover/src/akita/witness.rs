@@ -23,7 +23,7 @@ use jolt_witness::{collect_bundles, JoltWitnessPlane, WitnessBundle};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::ProverError;
+use crate::{telemetry, ProverError};
 
 /// The per-cycle sources every `OneHotTrace` column derives from: the
 /// instruction's lookup index, the mapped bytecode PC, the remapped RAM word
@@ -172,6 +172,7 @@ pub fn assemble_one_hot_trace_rows<F: JoltField>(
     log_k_chunk: usize,
     log_t: usize,
 ) -> Result<Arc<dyn TraceOneHotRows>, ProverError<F>> {
+    let _profile = telemetry::stage("witness.one_hot_trace");
     PackedTraceRows::validate_dimensions::<F>(plan, log_k_chunk, log_t)?;
     let num_rows = 1usize << log_t;
     let num_columns = plan.packing().ids().len();
@@ -335,6 +336,11 @@ pub fn commit_advice<PCS>(
 where
     PCS: CommitmentScheme + TransparentObjectSetup,
 {
+    let name = match kind {
+        JoltAdviceKind::Trusted => "trusted_advice",
+        JoltAdviceKind::Untrusted => "untrusted_advice",
+    };
+    let profile = telemetry::stage(format!("witness.{name}"));
     let words = common::advice::canonical_advice_words(advice_bytes, max_advice_bytes)
         .map_err(commit_failed)?;
     let word_vars = words.len().ilog2() as usize;
@@ -348,7 +354,12 @@ where
         *evaluation = PCS::Field::from_u64(word);
     }
     let polynomial = Polynomial::new(evaluations);
-    let (commitment, hint) = PCS::commit(&polynomial, &setup).map_err(commit_failed)?;
+    drop(profile);
+    let (commitment, hint) = {
+        let profile = telemetry::stage(format!("commitment.{name}"));
+        profile.metadata("backend", "cpu");
+        PCS::commit(&polynomial, &setup).map_err(commit_failed)?
+    };
     Ok(AdviceObject {
         plan,
         commitment,
@@ -392,6 +403,7 @@ pub fn commit_direct_program<PCS>(
 where
     PCS: CommitmentScheme + TransparentObjectSetup,
 {
+    let _profile = telemetry::stage("preprocessing.direct_program");
     let bytecode_len = program.bytecode.bytecode.len();
     let image_words = program_image_words_padded(program);
     let plan = committed_program_packing_plan(
@@ -448,7 +460,11 @@ where
                 .map_err(commit_failed)?
                 .0
             };
-            let (commitment, hint) = PCS::commit(&witness, &setup).map_err(commit_failed)?;
+            let (commitment, hint) = {
+                let profile = telemetry::stage(format!("commitment.program.{id:?}"));
+                profile.metadata("backend", "cpu");
+                PCS::commit(&witness, &setup).map_err(commit_failed)?
+            };
             let _ = setups.entry(physical_vars).or_insert_with(|| setup.clone());
             Ok(DirectProgramObject {
                 plan: object_plan.clone(),

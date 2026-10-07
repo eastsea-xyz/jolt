@@ -208,6 +208,7 @@ impl SolinasMetal {
             summarize.end_encoding();
 
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             completed_command_gpu_time(command)
         })?;
@@ -433,6 +434,7 @@ impl BytecodeAddressResidentInvocation {
             reduce.end_encoding();
 
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             completed_command_gpu_time(command)
         })?;

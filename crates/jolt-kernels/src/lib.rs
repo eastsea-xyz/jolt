@@ -42,6 +42,8 @@ mod kernel;
 pub mod mem;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal::profiling as metal_profiling;
 pub mod opening;
 pub mod optimized;
 pub mod precommitted_reduction;

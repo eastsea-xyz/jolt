@@ -648,6 +648,7 @@ fn initialize_storage(
             }
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         completed_command_gpu_time(command_buffer)?
@@ -673,6 +674,7 @@ impl SolinasMetal {
             encoder.fill_buffer(&state_b, NSRange::new(0, state_b.length()), 0);
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         let _ = completed_command_gpu_time(command_buffer)?;

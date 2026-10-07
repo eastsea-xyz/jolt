@@ -557,6 +557,7 @@ impl SolinasMetal {
             );
             encoder.end_encoding();
             command.commit();
+            crate::metal::profiling::record_submission(&command);
         });
         Ok(PendingInstructionReadRafSourcePrimer {
             source,

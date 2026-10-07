@@ -50,6 +50,7 @@ mod preprocessing;
 pub mod profile;
 mod recorder;
 pub mod stages;
+pub mod telemetry;
 
 #[cfg(feature = "akita")]
 pub use akita::prove;

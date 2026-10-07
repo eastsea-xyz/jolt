@@ -622,6 +622,7 @@ impl RamValSequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
@@ -688,6 +689,7 @@ impl RamValSequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok::<bool, MetalError>(final_in_a)
         })?;
         self.pending_first_message = Some(PendingFirstMessage {
@@ -749,6 +751,7 @@ impl RamValSequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;

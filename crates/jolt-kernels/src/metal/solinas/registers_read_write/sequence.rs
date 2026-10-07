@@ -870,6 +870,7 @@ impl SolinasMetal {
             encoder.end_encoding();
             let started = Instant::now();
             command.commit();
+            crate::metal::profiling::record_submission(&command);
             started
         });
         let source_identities = sources.each_ref().map(|buffer| buffer.as_ptr() as usize);
@@ -1626,6 +1627,7 @@ impl RegistersReadWriteCycleSequence {
             encoder.end_encoding();
             let started = Instant::now();
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             let wall = started.elapsed();
             let gpu_active = completed_command_gpu_time(command)?;
@@ -2556,6 +2558,7 @@ impl RegistersReadWriteCycleSequence {
             encoder.end_encoding();
             let started = Instant::now();
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             let wall = started.elapsed();
             let gpu_active = completed_command_gpu_time(command)?;
@@ -3045,6 +3048,7 @@ impl RegistersReadWriteCycleSequence {
             encoder.end_encoding();
             let started = Instant::now();
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             let wall = started.elapsed();
             let gpu_active = completed_command_gpu_time(command)?;
@@ -3143,8 +3147,10 @@ impl RegistersReadWriteCycleSequence {
             let started = Instant::now();
             if let Some(prefill_command) = prefill_command.as_ref() {
                 prefill_command.commit();
+                crate::metal::profiling::record_submission(prefill_command);
             }
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             if let Some(prefill_command) = prefill_command.as_ref() {
                 prefill_command.wait_until_completed();
@@ -3725,8 +3731,10 @@ impl RegistersReadWriteCycleSequence {
             let started = Instant::now();
             if let Some(prefill_command) = prefill_command.as_ref() {
                 prefill_command.commit();
+                crate::metal::profiling::record_submission(prefill_command);
             }
             command.commit();
+            crate::metal::profiling::record_submission(command);
             command.wait_until_completed();
             if let Some(prefill_command) = prefill_command.as_ref() {
                 prefill_command.wait_until_completed();

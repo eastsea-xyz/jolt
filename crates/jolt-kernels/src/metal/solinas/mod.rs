@@ -70,7 +70,7 @@ mod ram_val_sequence;
 pub mod registers_claim_reduction;
 pub(crate) mod registers_read_write;
 mod registers_val;
-mod runtime;
+pub(crate) mod runtime;
 mod source;
 mod spartan_outer_uniskip;
 pub mod spartan_shift;

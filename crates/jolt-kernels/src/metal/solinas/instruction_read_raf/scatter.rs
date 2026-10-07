@@ -551,6 +551,7 @@ impl SolinasMetal {
             encoder.end_encoding();
         });
         command_buffer.commit();
+        crate::metal::profiling::record_submission(command_buffer);
         command_buffer.wait_until_completed();
         tracing::info!(
             target: "jolt::metal",

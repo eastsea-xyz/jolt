@@ -278,6 +278,7 @@ impl RegistersReadWriteFirstMessageInvocation<'_> {
             encoder.end_encoding();
             let started = Instant::now();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             let wall = started.elapsed();
             let gpu_active = completed_command_gpu_time(command_buffer)?;

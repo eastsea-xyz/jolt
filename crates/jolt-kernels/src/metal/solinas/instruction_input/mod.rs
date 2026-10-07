@@ -999,6 +999,7 @@ impl InstructionInputSequenceStorage {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok::<(), MetalError>(())
         })?;
         Ok(InstructionInputNativePrimerCommand {
@@ -1326,6 +1327,7 @@ impl InstructionInputSequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
@@ -1429,6 +1431,7 @@ fn initialize_storage(
             }
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         let _ = completed_command_gpu_time(command_buffer)?;

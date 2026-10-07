@@ -1011,6 +1011,7 @@ impl AddressPhaseSequence {
             suffix_finalize.end_encoding();
 
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         validate_completed_command(command_buffer)?;
@@ -1172,6 +1173,7 @@ impl AddressPhaseSequence {
             );
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         validate_completed_command(command_buffer)?;
@@ -1336,6 +1338,7 @@ impl AddressPhaseSequence {
             }
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
         });
         validate_completed_command(command_buffer)?;

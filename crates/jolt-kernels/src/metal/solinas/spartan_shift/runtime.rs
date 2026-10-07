@@ -575,6 +575,7 @@ impl SpartanShiftPrefixInvocation {
             );
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok(())
         })?;
         Ok(SpartanShiftSubmittedCommand {
@@ -657,6 +658,7 @@ impl SpartanShiftFoldInvocation {
             );
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
         });
         Ok(SpartanShiftSubmittedCommand {
             command_buffer,

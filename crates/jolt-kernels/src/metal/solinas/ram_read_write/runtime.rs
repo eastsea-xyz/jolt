@@ -1381,6 +1381,7 @@ impl SolinasMetal {
             }
             encoder.end_encoding();
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok::<_, MetalError>(command_buffer)
         })?;
         command_buffer.wait_until_completed();
@@ -1915,6 +1916,7 @@ impl RamReadWriteSequence {
             };
             self.resolve_dispatch_counters(&command_buffer);
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok(SequenceCommand {
                 command_buffer,
                 address_output: outputs.0,
@@ -2027,6 +2029,7 @@ impl RamReadWriteSequence {
             }
             self.resolve_dispatch_counters(&command_buffer);
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok(SequenceCommand {
                 command_buffer,
                 address_output: None,
@@ -2208,6 +2211,7 @@ impl RamReadWriteSequence {
                 blit.end_encoding();
             }
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
             Ok(SequenceCommand {
                 command_buffer,
                 address_output,

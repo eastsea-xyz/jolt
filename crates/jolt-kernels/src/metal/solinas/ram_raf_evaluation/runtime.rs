@@ -650,6 +650,7 @@ impl RamRafSequence {
             finalize.end_encoding();
 
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
         });
         RamRafCommand {
             command_buffer,
@@ -864,6 +865,7 @@ impl RamRafSegmentedSequence {
             }
 
             command_buffer.commit();
+            crate::metal::profiling::record_submission(&command_buffer);
         });
         RamRafSegmentedCommand {
             command_buffer,

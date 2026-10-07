@@ -259,6 +259,7 @@ impl BytecodeAddressSparseInvocation {
             let command_buffer = self.context.queue.new_command_buffer();
             self.encode(command_buffer);
             command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
             command_buffer.wait_until_completed();
             validate_completed_command(command_buffer)?;
             self.validate_source()?;

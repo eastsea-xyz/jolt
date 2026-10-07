@@ -30,6 +30,7 @@ use jolt_prover::akita::preprocessing::{
     verifier_preprocess_full_with_advice, AkitaProverPreprocessing, AkitaVerifierPreprocessing,
 };
 use jolt_prover::akita::JoltAkitaBackend;
+use jolt_prover::telemetry;
 use jolt_prover::ProverConfig;
 use jolt_witness::{JoltVmWitnessConfig, JoltVmWitnessInputs, TraceBackend as WitnessTraceBackend};
 
@@ -100,6 +101,7 @@ impl AkitaPreprocessing {
         untrusted_advice: bool,
         trusted_advice: bool,
     ) -> Result<Arc<AkitaProverPreprocessing>, PreprocessingError> {
+        let profile = telemetry::stage("shape.setup");
         let key = ShapeKey {
             trace_length: config.trace_length,
             ram_k: config.ram_K,
@@ -108,8 +110,10 @@ impl AkitaPreprocessing {
         };
         let mut setups = self.setups.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(setup) = setups.get(&key) {
+            profile.metadata("cache_hit", "true");
             return Ok(Arc::clone(setup));
         }
+        profile.metadata("cache_hit", "false");
         let program = (*self.shared.program).clone();
         let setup = match self.bytecode_chunk_count {
             Some(chunks) => preprocess_committed_with_advice(
@@ -313,11 +317,13 @@ fn with_backend<R>(
     f: impl FnOnce(&AkitaBackend) -> Result<R, Box<dyn StdError + Send + Sync>>,
 ) -> Result<R, Box<dyn StdError + Send + Sync>> {
     let mode = backend_mode(bytecode_len);
+    telemetry::metadata("backend_mode", format!("{mode:?}"));
     let backend = BACKEND.with(|cell| -> Result<_, Box<dyn StdError + Send + Sync>> {
         let mut cached = cell.borrow_mut();
         match cached.as_ref() {
             Some((cached_mode, backend)) if *cached_mode == mode => Ok(Rc::clone(backend)),
             _ => {
+                let _profile = telemetry::stage("backend.initialize");
                 eprintln!(
                     "jolt-sdk: Akita prover backend {mode:?} (bytecode length {bytecode_len})"
                 );
@@ -344,7 +350,11 @@ pub fn prove_program(
     trusted_advice_hint: Option<TrustedAdviceOpeningHint>,
     advice_tape: Option<Vec<u8>>,
 ) -> Result<(RV64IMACProof, JoltDevice), Box<dyn StdError + Send + Sync>> {
-    let program = Arc::new(source.build_jolt_program()?);
+    let _profile = telemetry::stage("sdk.prove_program");
+    let program = {
+        let _profile = telemetry::stage("guest_program.load");
+        Arc::new(source.build_jolt_program()?)
+    };
     let program_preprocessing = Arc::clone(&preprocessing.shared.program);
     let memory_layout = &program_preprocessing.memory_layout;
     let memory_config = MemoryConfig {
@@ -364,30 +374,56 @@ pub fn prove_program(
     )
     .with_advice_tape(advice_tape);
     #[cfg(not(feature = "field-inline"))]
-    let trace = TracerBackend::new().trace_compact(
-        &program,
-        trace_inputs,
-        &program_preprocessing.bytecode,
-    )?;
+    let trace = {
+        let _profile = telemetry::stage("guest.execution_trace");
+        TracerBackend::new().trace_compact(
+            &program,
+            trace_inputs,
+            &program_preprocessing.bytecode,
+        )?
+    };
     #[cfg(feature = "field-inline")]
-    let trace = program.trace_with(&mut TracerBackend::new(), trace_inputs)?;
+    let trace = {
+        let _profile = telemetry::stage("guest.execution_trace");
+        program.trace_with(&mut TracerBackend::new(), trace_inputs)?
+    };
+    #[cfg(not(feature = "field-inline"))]
+    telemetry::metadata("raw_trace_rows", trace.trace.as_slice().len().to_string());
+    #[cfg(feature = "field-inline")]
+    telemetry::metadata("raw_trace_rows", trace.trace.rows().len().to_string());
     let public_io = trace.device.clone();
     #[cfg(not(feature = "field-inline"))]
-    let config = ProverConfig::derive_compact::<F>(
-        trace.trace.as_slice(),
-        memory_layout,
-        program_preprocessing.ram.min_bytecode_address,
-        program_preprocessing.ram.bytecode_words.len(),
-        program_preprocessing.max_padded_trace_length,
-    )?;
+    let config = {
+        let _profile = telemetry::stage("configuration.derive");
+        ProverConfig::derive_compact::<F>(
+            trace.trace.as_slice(),
+            memory_layout,
+            program_preprocessing.ram.min_bytecode_address,
+            program_preprocessing.ram.bytecode_words.len(),
+            program_preprocessing.max_padded_trace_length,
+        )?
+    };
     #[cfg(feature = "field-inline")]
-    let config = ProverConfig::derive::<F>(
-        trace.trace.rows(),
-        memory_layout,
-        program_preprocessing.ram.min_bytecode_address,
-        program_preprocessing.ram.bytecode_words.len(),
-        program_preprocessing.max_padded_trace_length,
-    )?;
+    let config = {
+        let _profile = telemetry::stage("configuration.derive");
+        ProverConfig::derive::<F>(
+            trace.trace.rows(),
+            memory_layout,
+            program_preprocessing.ram.min_bytecode_address,
+            program_preprocessing.ram.bytecode_words.len(),
+            program_preprocessing.max_padded_trace_length,
+        )?
+    };
+    telemetry::metadata("padded_trace_rows", config.trace_length.to_string());
+    telemetry::metadata("ram_K", config.ram_K.to_string());
+    telemetry::metadata(
+        "max_padded_trace_rows",
+        program_preprocessing.max_padded_trace_length.to_string(),
+    );
+    telemetry::metadata(
+        "one_hot_chunk_bits",
+        config.one_hot_config.committed_chunk_bits().to_string(),
+    );
     let has_trusted_advice = trusted_advice_hint.is_some();
     if trusted_advice_commitment.is_some() != has_trusted_advice {
         return Err(IoError::new(
@@ -407,9 +443,15 @@ pub fn prove_program(
     .include_untrusted_advice(has_untrusted_advice);
     let witness_inputs = JoltVmWitnessInputs::new(&program, &program_preprocessing, trace);
     #[cfg(not(feature = "field-inline"))]
-    let witness = WitnessTraceBackend::<OwnedTrace>::from_compact(witness_config, witness_inputs);
+    let witness = {
+        let _profile = telemetry::stage("witness.trace_backend");
+        WitnessTraceBackend::<OwnedTrace>::from_compact(witness_config, witness_inputs)
+    };
     #[cfg(feature = "field-inline")]
-    let witness = WitnessTraceBackend::<OwnedTrace>::try_new(witness_config, witness_inputs)?;
+    let witness = {
+        let _profile = telemetry::stage("witness.trace_backend");
+        WitnessTraceBackend::<OwnedTrace>::try_new(witness_config, witness_inputs)?
+    };
     let proof = with_backend(program_preprocessing.bytecode.code_size, |backend| {
         Ok(jolt_prover::akita::prove::<
             F,

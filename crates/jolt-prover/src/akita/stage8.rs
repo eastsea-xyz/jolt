@@ -20,6 +20,7 @@ use jolt_verifier::stages::stage8::packed::{
 use jolt_verifier::{CheckedInputs, VerifierError};
 
 use super::witness::{AdviceObject, DirectProgramObjects};
+use crate::telemetry;
 use crate::{JoltProverPreprocessing, ProverConfig, ProverError};
 
 fn batch_failed<F: JoltField>(reason: impl ToString) -> ProverError<F> {
@@ -67,6 +68,7 @@ where
     VC: VectorCommitment<Field = F>,
     T: Transcript<Challenge = F>,
 {
+    let profile = telemetry::stage("opening.claim_reduction");
     let log_t = checked.trace_length.ilog2() as usize;
     let chunk_width = config.one_hot_config.committed_chunk_bits();
     let formula_dimensions = crate::stages::formula_dimensions(
@@ -141,7 +143,9 @@ where
         packed_claim.point.as_slice().to_vec(),
         vec![packed_claim.value],
     );
+    drop(profile);
     tracing::info_span!("akita_main_batched_prove").in_scope(|| {
+        let _profile = telemetry::stage("opening.akita_pcs");
         PCS::prove_batch(
             &preprocessing.pcs_setup,
             precommitted,

@@ -1,7 +1,7 @@
 //! Packed stage 0: input validation, commitments, and transcript setup.
 
 use common::jolt_device::JoltDevice;
-use jolt_akita::TraceOneHotCommitment;
+use jolt_akita::{TraceCommitmentBackend, TraceOneHotCommitment};
 use jolt_claims::protocols::jolt::lattice::{OneHotTraceShape, ONE_HOT_TRACE_LAYOUT};
 use jolt_claims::protocols::jolt::{JoltAdviceKind, JoltRelationId, TracePolynomialOrder};
 use jolt_crypto::VectorCommitment;
@@ -18,6 +18,7 @@ use jolt_witness::JoltWitnessPlane;
 
 use super::witness::{assemble_one_hot_trace_rows, commit_advice, AdviceObject};
 use super::JoltAkitaBackend;
+use crate::telemetry;
 use crate::{JoltProverPreprocessing, ProverConfig, ProverError};
 
 /// Outputs retained for later prover stages.
@@ -52,6 +53,7 @@ where
     T: Transcript<Challenge = F>,
     W: JoltWitnessPlane<F>,
 {
+    let profile = telemetry::stage("stage0.validate_layout");
     if config.trace_polynomial_order != TracePolynomialOrder::CycleMajor {
         return Err(ProverError::Unsupported {
             reason: "Akita supports only cycle-major trace polynomials",
@@ -143,6 +145,7 @@ where
             reason: "the packed setup's layout digest is not the canonical OneHotTrace digest",
         });
     }
+    drop(profile);
     // Precommitted objects precede the trace because their profiles select its grouped row.
     let untrusted_advice = if untrusted_advice_present {
         Some(commit_advice::<PCS>(
@@ -211,6 +214,8 @@ where
             let packed_trace_rows = std::thread::scope(|scope| {
                 let prewarm = scope.spawn(move || {
                     tracing::info_span!("akita_prewarm_trace_commitment").in_scope(|| {
+                        let profile = telemetry::asynchronous_stage("commitment.prewarm_async");
+                        profile.metadata("backend", trace_backend.mode_name());
                         PCS::prewarm_trace_commitment(trace_backend, pcs_setup, trace_num_vars)
                     })
                 });
@@ -239,14 +244,24 @@ where
                 .iter()
                 .map(|(_, _, hint)| *hint)
                 .collect::<Vec<_>>();
-            let committed = PCS::commit_trace_one_hot(
-                &backend.trace_commitment,
-                &preprocessing.pcs_setup,
-                preprocessing.pcs_setup.default_layout_digest(),
-                plan.packing().slot_capacity(),
-                packed_trace_rows,
-                &precommitted_hints,
-            );
+            let committed = {
+                let profile = telemetry::stage("commitment.main_trace");
+                let metal = trace_backend.mode_name() != "cpu"
+                    && TraceCommitmentBackend::shape_is_metal_qualified(
+                        1usize << log_k_chunk,
+                        trace_num_vars,
+                    );
+                profile.metadata("backend", if metal { "metal" } else { "cpu" });
+                profile.metadata("packed_num_vars", trace_num_vars.to_string());
+                PCS::commit_trace_one_hot(
+                    &backend.trace_commitment,
+                    &preprocessing.pcs_setup,
+                    preprocessing.pcs_setup.default_layout_digest(),
+                    plan.packing().slot_capacity(),
+                    packed_trace_rows,
+                    &precommitted_hints,
+                )
+            };
             let (commitment, hint) =
                 committed.map_err(|error| VerifierError::FinalOpeningVerificationFailed {
                     reason: error.to_string(),
