@@ -818,7 +818,10 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
         // Scheduling happens before prove_round installs Product9. The retained
         // T24 address carrier also launches GPU work at that first-cycle seam.
         if self.address_sequence.is_some()
-            && self.resident_lookup_plane.as_ref().is_some_and(|plane| plane.len() == 1 << 24)
+            && self
+                .resident_lookup_plane
+                .as_ref()
+                .is_some_and(|plane| plane.len() == 1 << 24)
         {
             return RoundExecutionDomain::Accelerator;
         }
@@ -852,14 +855,23 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
         if self.product9.is_none()
             && self.address_sequence.is_some()
             && self.cpu.metal_product9_cycle_available()
-            && self.resident_lookup_plane.as_ref().is_some_and(|plane| plane.len() == 1 << 24)
+            && self
+                .resident_lookup_plane
+                .as_ref()
+                .is_some_and(|plane| plane.len() == 1 << 24)
         {
-            let address = self.address_sequence.take()
+            let address = self
+                .address_sequence
+                .take()
                 .ok_or_else(|| backend_error("Product9 address source disappeared"))?;
-            let source = (*address).into_product9_source()
+            let source = (*address)
+                .into_product9_source()
                 .map_err(|error| backend_error(error.to_string()))?;
             let adapter = Product9CycleAdapter::prepare(
-                &mut self.cpu, self.context.as_ref().clone(), source, self.config.cutoff_elements,
+                &mut self.cpu,
+                self.context.as_ref().clone(),
+                source,
+                self.config.cutoff_elements,
             )?;
             self.host_tail = None; // Release the unused Product5 CPU-tail reservation.
             self.product9 = Some(adapter);
@@ -952,7 +964,9 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
     }
 
     fn finish_rounds(&mut self, bind: AkitaField) -> Result<(), SumcheckError<AkitaField>> {
-        if let Some(adapter) = self.product9.as_mut() { adapter.restore(&mut self.cpu)?; }
+        if let Some(adapter) = self.product9.as_mut() {
+            adapter.restore(&mut self.cpu)?;
+        }
         if self.sequence.is_some() {
             self.restore_cpu_tail()?;
         }

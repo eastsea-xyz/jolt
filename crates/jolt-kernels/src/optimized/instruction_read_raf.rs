@@ -2013,16 +2013,24 @@ impl OptimizedInstructionReadRafKernel<AkitaField> {
     pub(crate) fn metal_product9_cycle_available(&self) -> bool {
         self.dimensions.num_virtual_ra_polys() == 8
             && self.progress.bound() == self.address_bits()
-            && self.cycle.as_ref().is_some_and(|cycle| matches!(cycle.tables, CycleTables::Pending(_)))
+            && self
+                .cycle
+                .as_ref()
+                .is_some_and(|cycle| matches!(cycle.tables, CycleTables::Pending(_)))
     }
 
     pub(crate) fn metal_product9_cycle_input(
         &self,
     ) -> Result<crate::metal::solinas::Product9CycleInput, SumcheckError<AkitaField>> {
         if !self.metal_product9_cycle_available() {
-            return Err(metal_state_error("Product9 requires the G8 pending cycle boundary"));
+            return Err(metal_state_error(
+                "Product9 requires the G8 pending cycle boundary",
+            ));
         }
-        let cycle = self.cycle.as_ref().ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
+        let cycle = self
+            .cycle
+            .as_ref()
+            .ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
         let CycleTables::Pending(pending) = &cycle.tables else {
             return Err(metal_state_error("Product9 bases are no longer pending"));
         };
@@ -2036,9 +2044,14 @@ impl OptimizedInstructionReadRafKernel<AkitaField> {
 
     pub(crate) fn metal_begin_product9_cycle(&mut self) -> Result<(), SumcheckError<AkitaField>> {
         if !self.metal_product9_cycle_available() {
-            return Err(metal_state_error("Product9 handoff is outside the pending G8 boundary"));
+            return Err(metal_state_error(
+                "Product9 handoff is outside the pending G8 boundary",
+            ));
         }
-        let cycle = self.cycle.as_mut().ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
+        let cycle = self
+            .cycle
+            .as_mut()
+            .ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
         cycle.tables = CycleTables::Offloaded;
         // The GPU holds the original lookup/claim buffers, not these 40-byte
         // host rows. Claim columns remain alive for the existing output claims.
@@ -2052,9 +2065,16 @@ impl OptimizedInstructionReadRafKernel<AkitaField> {
         q_evals: &[AkitaField; 9],
         previous_claim: AkitaField,
     ) -> Result<UnivariatePoly<AkitaField>, SumcheckError<AkitaField>> {
-        let cycle = self.cycle.as_ref().ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
-        if self.dimensions.num_virtual_ra_polys() != 8 || !matches!(cycle.tables, CycleTables::Offloaded) {
-            return Err(metal_state_error("Product9 q-grid requires offloaded G8 cycle state"));
+        let cycle = self
+            .cycle
+            .as_ref()
+            .ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
+        if self.dimensions.num_virtual_ra_polys() != 8
+            || !matches!(cycle.tables, CycleTables::Offloaded)
+        {
+            return Err(metal_state_error(
+                "Product9 q-grid requires offloaded G8 cycle state",
+            ));
         }
         Ok(cycle.gruen.gruen_poly_from_evals(q_evals, previous_claim))
     }
@@ -2063,19 +2083,34 @@ impl OptimizedInstructionReadRafKernel<AkitaField> {
         &mut self,
         tables: [Vec<AkitaField>; 9],
     ) -> Result<(), SumcheckError<AkitaField>> {
-        let remaining = self.progress.total().checked_sub(self.progress.bound())
+        let remaining = self
+            .progress
+            .total()
+            .checked_sub(self.progress.bound())
             .ok_or_else(|| metal_state_error("Product9 progress exceeds relation rounds"))?;
-        let expected = 1usize.checked_shl(remaining as u32)
+        let expected = 1usize
+            .checked_shl(remaining as u32)
             .ok_or_else(|| metal_state_error("Product9 tail length overflow"))?;
-        if self.dimensions.num_virtual_ra_polys() != 8 || tables.iter().any(|table| table.len() != expected) {
-            return Err(metal_state_error("Product9 tail geometry disagrees with CPU binding progress"));
+        if self.dimensions.num_virtual_ra_polys() != 8
+            || tables.iter().any(|table| table.len() != expected)
+        {
+            return Err(metal_state_error(
+                "Product9 tail geometry disagrees with CPU binding progress",
+            ));
         }
-        let cycle = self.cycle.as_mut().ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
+        let cycle = self
+            .cycle
+            .as_mut()
+            .ok_or_else(|| metal_state_error("Product9 cycle missing"))?;
         if !matches!(cycle.tables, CycleTables::Offloaded) {
-            return Err(metal_state_error("Product9 tail restored outside offloaded state"));
+            return Err(metal_state_error(
+                "Product9 tail restored outside offloaded state",
+            ));
         }
         let mut factors = tables.into_iter();
-        let combined_val = factors.next().ok_or_else(|| metal_state_error("Product9 Val missing"))?;
+        let combined_val = factors
+            .next()
+            .ok_or_else(|| metal_state_error("Product9 Val missing"))?;
         cycle.tables = CycleTables::Dense {
             combined_val: Polynomial::new(combined_val),
             ra: factors.map(Polynomial::new).collect(),

@@ -94,7 +94,7 @@ impl TraceCommitmentBackend {
 
     pub const fn shape_is_metal_qualified(one_hot_k: usize, num_vars: usize) -> bool {
         match one_hot_k {
-            AKITA_ONE_HOT_K16 => matches!(num_vars, 34..=38),
+            AKITA_ONE_HOT_K16 => matches!(num_vars, 32..=38),
             AKITA_ONE_HOT_K256 => matches!(num_vars, 38..=41),
             _ => false,
         }
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    fn k16_small_opening_metal_qualification_preserves_commit_and_k256_ranges() {
+    fn k16_small_commit_and_opening_metal_qualification_preserves_k256_ranges() {
         for num_vars in 30..=43 {
             assert_eq!(
                 TraceCommitmentBackend::opening_shape_is_metal_qualified(
@@ -1244,7 +1244,7 @@ mod tests {
             );
             assert_eq!(
                 TraceCommitmentBackend::shape_is_metal_qualified(AKITA_ONE_HOT_K16, num_vars),
-                (34..=38).contains(&num_vars),
+                (32..=38).contains(&num_vars),
             );
             assert_eq!(
                 TraceCommitmentBackend::opening_shape_is_metal_qualified(

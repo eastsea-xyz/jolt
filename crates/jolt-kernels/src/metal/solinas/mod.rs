@@ -72,10 +72,10 @@ pub mod registers_claim_reduction;
 pub(crate) mod registers_read_write;
 mod registers_val;
 pub(crate) mod runtime;
-pub mod trace_replay;
 mod source;
 mod spartan_outer_uniskip;
 pub mod spartan_shift;
+pub mod trace_replay;
 
 use runtime::{
     buffer_from_slice, completed_command_gpu_time, encode_column_reductions,
