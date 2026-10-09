@@ -49,7 +49,6 @@ impl MemoryProbe {
                         (),
                     )
                     .ok()
-                    .map(|bytes| bytes as u64)
             });
             MemorySnapshot {
                 metal_allocated_bytes,

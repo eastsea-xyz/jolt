@@ -41,10 +41,18 @@ use crate::{
 // above 2^16 addresses no longer fit the work-item ABI.
 const RESIDENT_RADIX_MIN_ADDRESS_LOG2: u32 = 12;
 const RESIDENT_RADIX_MAX_ADDRESS_LOG2: u32 = 16;
+const COMPACT_MAX_ADDRESS_LOG2: u32 = 21;
+const COMPACT_TRACE_CUTOFF: usize = 1 << 22;
 
 fn resident_radix_supports(address_elements: usize) -> bool {
     address_elements.is_power_of_two()
         && (RESIDENT_RADIX_MIN_ADDRESS_LOG2..=RESIDENT_RADIX_MAX_ADDRESS_LOG2)
+            .contains(&address_elements.ilog2())
+}
+
+fn compact_supports(address_elements: usize) -> bool {
+    address_elements.is_power_of_two()
+        && (RESIDENT_RADIX_MAX_ADDRESS_LOG2 + 1..=COMPACT_MAX_ADDRESS_LOG2)
             .contains(&address_elements.ilog2())
 }
 
@@ -89,6 +97,7 @@ enum BytecodeReadRafAddressRoute {
     Cpu(&'static str),
     Stage1Sparse,
     ResidentRadix,
+    Compact,
 }
 
 fn select_bytecode_address_route(
@@ -100,6 +109,18 @@ fn select_bytecode_address_route(
 ) -> BytecodeReadRafAddressRoute {
     if config.implementation == BytecodeReadRafAddressImplementation::Cpu {
         return BytecodeReadRafAddressRoute::Cpu("configured_cpu");
+    }
+    // The compact route needs resident rows, not the Stage-1 u16 topology.
+    // Keep the legacy cutoff for smaller domains while avoiding wide-domain
+    // CPU scratch at the measured 2^22/2^24-row production geometries.
+    if compact_supports(address_elements)
+        && trace_elements >= config.trace_cutoff_elements.min(COMPACT_TRACE_CUTOFF)
+    {
+        return if has_resident_rows {
+            BytecodeReadRafAddressRoute::Compact
+        } else {
+            BytecodeReadRafAddressRoute::Cpu("resident_rows")
+        };
     }
     if trace_elements < config.trace_cutoff_elements {
         return BytecodeReadRafAddressRoute::Cpu("trace_cutoff");
@@ -132,7 +153,9 @@ fn split_bytecode_address_eq_tables(
             reason: "bytecode address stage count is invalid",
         });
     }
-    if log_rows < INNER_LOG2 as usize || !resident_radix_supports(address_elements) {
+    if log_rows < INNER_LOG2 as usize
+        || !(resident_radix_supports(address_elements) || compact_supports(address_elements))
+    {
         return Err(KernelError::InvariantViolation {
             reason: "bytecode address geometry is invalid",
         });
@@ -313,6 +336,48 @@ impl PrepareKernel<AkitaField, BytecodeReadRafAddressPhase<AkitaField>> for Meta
             .collect::<Vec<_>>();
         let tables =
             split_bytecode_address_eq_tables(&stage_points, dimensions.log_t(), address_elements)?;
+        if route == BytecodeReadRafAddressRoute::Compact {
+            let _ = route_span.record("realized_route", "resident_compact_u32_v1");
+            let _ = route_span.record("fallback_reason", "none");
+            let span = tracing::info_span!(
+                "MetalBytecodeReadRafAddress::compact",
+                work_items = tracing::field::Empty,
+                waves = tracing::field::Empty,
+                member_owned_bytes = tracing::field::Empty,
+                gpu_ns = tracing::field::Empty,
+            );
+            let _guard = span.enter();
+            let rows = resident_rows.ok_or(KernelError::InvariantViolation {
+                reason: "compact bytecode address rows disappeared",
+            })?;
+            let observation = self
+                .context
+                .execute_bytecode_address_compact(
+                    rows,
+                    dimensions.log_k() as u32,
+                    &tables.e_lo,
+                    &tables.e_hi,
+                )
+                .map_err(|error| {
+                    KernelError::Sumcheck(metal_error(format!(
+                        "compact bytecode address execution failed: {error}"
+                    )))
+                })?;
+            let _ = span.record("work_items", observation.work_items);
+            let _ = span.record("waves", observation.waves);
+            let _ = span.record("member_owned_bytes", observation.member_owned_bytes);
+            let _ = span.record(
+                "gpu_ns",
+                u64::try_from(observation.gpu_time.as_nanos()).unwrap_or(u64::MAX),
+            );
+            let prepared = prepare_bytecode_read_raf_address_from_pushforwards(
+                witness,
+                cpu_inputs(),
+                observation.pushforwards,
+                observation.first_push_pc,
+            )?;
+            return Ok(Box::new(prepared));
+        }
         let (output, entry_trace_index) = match route {
             BytecodeReadRafAddressRoute::Stage1Sparse => {
                 let _ =
@@ -395,7 +460,7 @@ impl PrepareKernel<AkitaField, BytecodeReadRafAddressPhase<AkitaField>> for Meta
                 drop(prepare_guard);
                 (observation.output, observation.first_push_pc)
             }
-            BytecodeReadRafAddressRoute::Cpu(_) => {
+            BytecodeReadRafAddressRoute::Cpu(_) | BytecodeReadRafAddressRoute::Compact => {
                 return Err(KernelError::InvariantViolation {
                     reason: "bytecode address CPU route escaped early dispatch",
                 });
@@ -746,6 +811,18 @@ mod tests {
         );
         assert_eq!(
             route(1 << 17, false, true),
+            BytecodeReadRafAddressRoute::Compact
+        );
+        assert_eq!(
+            route(1 << 21, false, true),
+            BytecodeReadRafAddressRoute::Compact
+        );
+        assert_eq!(
+            route(1 << 21, false, false),
+            BytecodeReadRafAddressRoute::Cpu("resident_rows")
+        );
+        assert_eq!(
+            route(1 << 22, false, true),
             BytecodeReadRafAddressRoute::Cpu("address_domain")
         );
         assert_eq!(
@@ -759,6 +836,23 @@ mod tests {
         assert_eq!(
             BytecodeReadRafAddressMetalConfig::default().implementation,
             BytecodeReadRafAddressImplementation::Cpu
+        );
+    }
+
+    #[test]
+    fn compact_production_route_starts_at_logt22_without_lowering_legacy_cutoff() {
+        let config = super::super::MetalConfig::production().bytecode_read_raf_address;
+        assert_eq!(
+            select_bytecode_address_route(1 << 22, 1 << 21, config, false, true),
+            BytecodeReadRafAddressRoute::Compact
+        );
+        assert_eq!(
+            select_bytecode_address_route(1 << 21, 1 << 21, config, false, true),
+            BytecodeReadRafAddressRoute::Cpu("trace_cutoff")
+        );
+        assert_eq!(
+            select_bytecode_address_route(1 << 22, 1 << 16, config, false, true),
+            BytecodeReadRafAddressRoute::Cpu("trace_cutoff")
         );
     }
 
@@ -808,6 +902,11 @@ mod tests {
     #[test]
     fn logk15_resident_route_matches_reference_without_stage1_topology() {
         resident_route_matches_reference_without_stage1_topology(15);
+    }
+
+    #[test]
+    fn logk17_compact_route_matches_reference_without_stage1_topology() {
+        resident_route_matches_reference_without_stage1_topology(17);
     }
 
     fn resident_route_matches_reference_without_stage1_topology(log_k: usize) {

@@ -7,6 +7,20 @@
 #define BYTECODE_ADDRESS_WORKER_SIMD_WIDTH 32u
 #define BYTECODE_ADDRESS_PACKED_ITEMS_PER_GROUP 4u
 
+// Separate wide ABI: the existing Stage-1 u16 descriptors remain unchanged.
+struct BytecodeAddressCompactItem {
+    uint address;
+    uint start;
+    uint count;
+    uint reserved;
+};
+
+struct BytecodeAddressCompactRange {
+    uint address;
+    uint begin;
+    uint end;
+};
+
 struct BytecodeAddressSparseWorkItem {
     ushort address;
     ushort outer;
@@ -38,6 +52,102 @@ inline uint bytecode_address_resident_pc(
         rows, params.physical_rows, BOOLEANITY_SOURCE_PC_WORD, row)
         & BOOLEANITY_SOURCE_PC_MASK;
     return plus_one == 0ul ? 0u : (uint)(plus_one - 1ul);
+}
+
+kernel void solinas_bytecode_address_compact_count(
+    device const ulong* rows [[buffer(0)]],
+    device atomic_uint* counts [[buffer(1)]],
+    device atomic_uint* status [[buffer(2)]],
+    constant BytecodeAddressSparseParams& params [[buffer(3)]],
+    uint row [[thread_position_in_grid]])
+{
+    if (row >= params.physical_rows) return;
+    ulong plus_one = booleanity_source_word(
+        rows, params.physical_rows, BOOLEANITY_SOURCE_PC_WORD, row)
+        & BOOLEANITY_SOURCE_PC_MASK;
+    ulong address = plus_one == 0ul ? 0ul : plus_one - 1ul;
+    if (row == 0u) atomic_store_explicit(&status[1], (uint)address, memory_order_relaxed);
+    // Validate before narrowing: large malformed PCs must not wrap into K.
+    if (address >= (ulong)params.addresses) {
+        atomic_fetch_add_explicit(&status[0], 1u, memory_order_relaxed);
+        return;
+    }
+    atomic_fetch_add_explicit(&counts[(uint)address], 1u, memory_order_relaxed);
+}
+
+kernel void solinas_bytecode_address_compact_scatter(
+    device const ulong* rows [[buffer(0)]],
+    device atomic_uint* cursors [[buffer(1)]],
+    device uint* row_indices [[buffer(2)]],
+    constant BytecodeAddressSparseParams& params [[buffer(3)]],
+    uint row [[thread_position_in_grid]])
+{
+    if (row >= params.physical_rows) return;
+    uint address = bytecode_address_resident_pc(rows, params, row);
+    uint slot = atomic_fetch_add_explicit(&cursors[address], 1u, memory_order_relaxed);
+    row_indices[slot] = row;
+}
+
+kernel void solinas_bytecode_address_compact_worker(
+    device const uint* row_indices [[buffer(0)]],
+    device const ulong* rows [[buffer(1)]],
+    device const BytecodeAddressCompactItem* items [[buffer(2)]],
+    device const SolinasFp128* e_lo [[buffer(3)]],
+    device const SolinasFp128* e_hi [[buffer(4)]],
+    device SolinasFp128* partials [[buffer(5)]],
+    constant BytecodeAddressSparseParams& params [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]])
+{
+    uint item_index = group * BYTECODE_ADDRESS_PACKED_ITEMS_PER_GROUP + simdgroup;
+    if (item_index >= params.work_items) return;
+    BytecodeAddressCompactItem item = items[item_index];
+    SolinasFp128 sums[BYTECODE_ADDRESS_WORKER_STAGES];
+    for (uint stage = 0u; stage < BYTECODE_ADDRESS_WORKER_STAGES; stage++)
+        sums[stage] = solinas_zero();
+    for (uint offset = lane; offset < item.count; offset += BYTECODE_ADDRESS_WORKER_SIMD_WIDTH) {
+        uint row = row_indices[item.start + offset];
+        uint outer = row / params.inner_length;
+        uint inner = row % params.inner_length;
+        ulong metadata = booleanity_source_word(rows, params.physical_rows, 3u, row);
+        bool negative = ((metadata >> BOOLEANITY_SOURCE_FUSED_SIGN_SHIFT) & 1ul) != 0ul;
+        ulong magnitude = booleanity_source_word(rows, params.physical_rows, 2u, row);
+        for (uint stage = 0u; stage < BYTECODE_ADDRESS_WORKER_STAGES; stage++) {
+            // An address bucket can mix outer blocks: factor BOTH weights
+            // per row, unlike the single-outer legacy sparse worker.
+            SolinasFp128 term = solinas_mul_wide(
+                e_lo[stage * params.inner_length + inner],
+                e_hi[stage * params.outer_length + outer]);
+            if (stage >= BYTECODE_ADDRESS_WORKER_BASE_STAGES)
+                term = solinas_half_width_mul_signed_u64(term, magnitude, negative);
+            sums[stage] = solinas_add(sums[stage], term);
+        }
+    }
+    for (uint stage = 0u; stage < BYTECODE_ADDRESS_WORKER_STAGES; stage++) {
+        SolinasFp128 sum = solinas_simd_sum_32(sums[stage]);
+        if (lane == 0u) partials[stage * params.work_items + item_index] = sum;
+    }
+}
+
+kernel void solinas_bytecode_address_compact_reduce(
+    device const SolinasFp128* partials [[buffer(0)]],
+    device const BytecodeAddressCompactRange* ranges [[buffer(1)]],
+    device SolinasFp128* output [[buffer(2)]],
+    constant BytecodeAddressSparseParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint active_addresses = params.reserved;
+    if (gid >= active_addresses * params.stages) return;
+    uint stage = gid / active_addresses;
+    BytecodeAddressCompactRange range = ranges[gid % active_addresses];
+    SolinasFp128 sum = solinas_zero();
+    for (uint item = range.begin; item < range.end; item++)
+        sum = solinas_add(sum, partials[stage * params.work_items + item]);
+    uint destination = stage * params.addresses + range.address;
+    // Each address occurs once in a wave. Waves complete serially, so no
+    // atomic field operation is needed when a hot address crosses a seam.
+    output[destination] = solinas_add(output[destination], sum);
 }
 
 kernel void solinas_bytecode_address_resident_count(

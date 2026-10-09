@@ -23,6 +23,102 @@ struct TestRow {
     fused_inc_negative: bool,
 }
 
+#[test]
+#[cfg(target_os = "macos")]
+fn compact_u32_pushforward_matches_nine_field_vectors_across_waves_and_outers() {
+    let shape = AddressMajorShape::new(16, 21, 15).unwrap();
+    let addresses = shape.addresses().unwrap();
+    let physical_rows = 50_000;
+    let source = (0..shape.rows().unwrap())
+        .map(|row| {
+            let mapped_pc = if row >= physical_rows {
+                None // Explicit padded rows contribute to address zero in base stages.
+            } else if row < 12_001 {
+                Some(65_536)
+            } else {
+                match row % 4 {
+                    0 => None,
+                    1 => Some(65_535),
+                    2 => Some(65_536),
+                    _ => Some(addresses - 1),
+                }
+            };
+            TestRow {
+                mapped_pc,
+                fused_inc_magnitude: if row >= physical_rows {
+                    0
+                } else if row % 17 == 0 {
+                    u64::MAX
+                } else {
+                    (row % 31 + 1) as u64
+                },
+                fused_inc_negative: row % 3 == 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let resident_source = source
+        .iter()
+        .map(|row| {
+            let magnitude = i128::from(row.fused_inc_magnitude);
+            BooleanityRow::new(
+                0,
+                row.mapped_pc.map(|pc| pc as u64),
+                None,
+                if row.fused_inc_negative {
+                    -magnitude
+                } else {
+                    magnitude
+                },
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let context = SolinasMetal::for_akita().unwrap();
+    let resident = context.prepare_booleanity_rows(&resident_source).unwrap();
+    let (e_lo, e_hi) = tables(shape);
+    let actual = context
+        .execute_bytecode_address_compact_with_wave_limit(resident, 21, &e_lo, &e_hi, 2)
+        .unwrap();
+    assert_eq!(actual.first_push_pc, 65_536);
+    assert_eq!(
+        actual.pushforwards.len(),
+        BYTECODE_ADDRESS_PUSHFORWARD_STAGES
+    );
+    assert!(actual.waves > 1);
+    assert!(actual.member_owned_bytes < 350 << 20);
+    let expected = direct_oracle(shape, &source, &e_lo, &e_hi);
+    for (actual, expected) in actual
+        .pushforwards
+        .iter()
+        .zip(expected.chunks_exact(addresses))
+    {
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn compact_u32_count_rejects_out_of_domain_and_non_narrowable_pcs() {
+    let shape = AddressMajorShape::new(15, 17, 15).unwrap();
+    let (e_lo, e_hi) = tables(shape);
+    let context = SolinasMetal::for_akita().unwrap();
+    for invalid_pc in [1 << 17, (1u64 << 32) + 65_536] {
+        let mut rows = vec![BooleanityRow::new(0, None, None, 0).unwrap(); shape.rows().unwrap()];
+        rows[19] = BooleanityRow::new(0, Some(invalid_pc), None, -7).unwrap();
+        let resident = context.prepare_booleanity_rows(&rows).unwrap();
+        let result =
+            context.execute_bytecode_address_compact_with_wave_limit(resident, 17, &e_lo, &e_hi, 2);
+        assert!(matches!(
+            result,
+            Err(
+                super::worklist_runtime::BytecodeAddressSparseRuntimeError::InvalidResidentState {
+                    invalid_rows: 1
+                }
+            )
+        ));
+    }
+}
+
 impl TestRow {
     fn push_pc(self) -> usize {
         self.mapped_pc.unwrap_or(0)
