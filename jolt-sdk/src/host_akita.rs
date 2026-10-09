@@ -389,6 +389,16 @@ pub fn prove_program(
     };
     #[cfg(not(feature = "field-inline"))]
     telemetry::metadata("raw_trace_rows", trace.trace.as_slice().len().to_string());
+    #[cfg(all(feature = "metal", target_os = "macos", not(feature = "field-inline")))]
+    if let Some(mode) = std::env::var_os("AETHER_PROVER_GPU_TRACE_REPLAY") {
+        if mode != "1" {
+            return Err("AETHER_PROVER_GPU_TRACE_REPLAY expects 1 for the diagnostic".into());
+        }
+        let _profile = telemetry::stage("trace.gpu_replay_prototype");
+        let report = jolt_prover::trace_replay::diagnose(trace.trace.as_slice())?;
+        telemetry::metadata("trace_gpu_replay_diagnostic", report.to_string());
+        eprintln!("jolt-sdk: {report}");
+    }
     #[cfg(feature = "field-inline")]
     telemetry::metadata("raw_trace_rows", trace.trace.rows().len().to_string());
     let public_io = trace.device.clone();

@@ -51,6 +51,8 @@ pub mod profile;
 mod recorder;
 pub mod stages;
 pub mod telemetry;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod trace_replay;
 
 #[cfg(feature = "akita")]
 pub use akita::prove;
