@@ -31,7 +31,7 @@ pub struct InstructionRaVirtualizationMetalConfig {
 impl Default for InstructionRaVirtualizationMetalConfig {
     fn default() -> Self {
         Self {
-            trace_cutoff_elements: 1 << 25,
+            trace_cutoff_elements: 1 << 24,
             cutoff_elements: 1 << 10,
             dispatch: InstructionRaSequenceConfig::default(),
         }
@@ -49,7 +49,11 @@ impl PrepareKernel<AkitaField, InstructionRaVirtualization<AkitaField>> for Meta
         KernelError<AkitaField>,
     > {
         let trace_elements = 1usize << inputs.relation.dimensions().log_t();
-        let dispatch = self.config.instruction_ra_virtualization.dispatch;
+        let mut dispatch = self.config.instruction_ra_virtualization.dispatch;
+        if inputs.relation.committed_chunk_bits() == 4 && dispatch.materialize_width.elements() < 64
+        {
+            dispatch.materialize_width = super::solinas::InstructionRaMaterializeWidth::W64;
+        }
         let initialization = prepare_instruction_ra_initialization(inputs)?;
         if trace_elements
             < self
@@ -102,6 +106,7 @@ impl PrepareKernel<AkitaField, InstructionRaVirtualization<AkitaField>> for Meta
                         e_in_capacity,
                         e_out_capacity,
                         dispatch,
+                        chunk_tables.len(),
                     )
                 });
             let _span = tracing::info_span!(
@@ -305,5 +310,215 @@ fn metal_error(message: impl Into<String>) -> SumcheckError<AkitaField> {
     SumcheckError::ComputeBackend {
         backend: "metal",
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "CPU and actual Metal parity fixtures")]
+mod tests {
+    use std::{num::NonZeroUsize, sync::Arc};
+
+    use jolt_claims::protocols::jolt::geometry::instruction::InstructionRaVirtualizationDimensions;
+    use jolt_field::{One as _, Ring as _};
+    use jolt_verifier::stages::relations::ConcreteSumcheck;
+    use jolt_witness::witnesses::FusedInc;
+
+    use super::*;
+    use crate::metal::solinas::{InstructionRaMaterializeWidth, SolinasMetal};
+    use crate::optimized::instruction_read_raf::InstructionCycleRow;
+    use crate::reference::views::eq_table;
+
+    fn field(value: u64) -> AkitaField {
+        AkitaField::from_u64(value)
+    }
+
+    fn gpu_cpu_parity(log_t: usize, groups: usize, bits: usize, gamma: AkitaField, reuse: bool) {
+        let count = groups * 4;
+        let lookups: Vec<u128> = (0..1 << log_t)
+            .map(|row| match row {
+                0 => 0,
+                1 => u128::MAX,
+                2 => 15u128 << 64, // Nibble factor 15, high limb's low nibble.
+                3 => 15u128 << 60, // Nibble factor 16, low limb's high nibble.
+                _ => {
+                    let high = (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let low = (row as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    (u128::from(high) << 64) | u128::from(low)
+                }
+            })
+            .collect();
+        let rows = Arc::new(
+            lookups
+                .iter()
+                .map(|index| {
+                    InstructionCycleRow::new(*index, None, false, 0, None, FusedInc::default())
+                })
+                .collect(),
+        );
+        let address: Vec<_> = (0..128)
+            .map(|index| field(31 + index as u64 * 11))
+            .collect();
+        let cycle: Vec<_> = (0..log_t)
+            .map(|index| field(113 + index as u64 * 17))
+            .collect();
+        let relation = InstructionRaVirtualization::new(
+            InstructionRaVirtualizationDimensions::new(
+                log_t,
+                NonZeroUsize::new(groups).unwrap(),
+                NonZeroUsize::new(4).unwrap(),
+            )
+            .unwrap(),
+            address.clone(),
+            cycle.clone(),
+            bits,
+        );
+        let claims = SumcheckInputClaims::<AkitaField, InstructionRaVirtualization<AkitaField>> {
+            instruction_ra: vec![AkitaField::zero(); groups],
+        };
+        let points = SumcheckInputPoints::<AkitaField, InstructionRaVirtualization<AkitaField>> {
+            instruction_ra: vec![Vec::new(); groups],
+        };
+        let challenges = InstructionRaVirtualizationChallenges { gamma };
+        let initialization = prepare_instruction_ra_initialization(ProverInputs {
+            relation: &relation,
+            claims: &claims,
+            points: &points,
+            challenges: &challenges,
+        })
+        .unwrap();
+        assert!(initialization.supports_metal_sequence());
+        let (offloaded, chunk_tables) = initialization.into_offloaded().unwrap();
+        let (e_in, e_out) = offloaded.metal_weights().unwrap();
+        let context = SolinasMetal::for_akita().unwrap();
+        let sequence = context
+            .prepare_instruction_ra_test_sequence(
+                &lookups,
+                &chunk_tables,
+                e_in.len(),
+                e_out.len(),
+                InstructionRaSequenceConfig {
+                    materialize_width: InstructionRaMaterializeWidth::W64,
+                    reuse_inverse_for_dense: reuse,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut actual =
+            MetalInstructionRaVirtualizationKernel::new(offloaded, sequence, 4).unwrap();
+        let mut expected = OptimizedInstructionRaVirtualizationKernel::new(
+            log_t, groups, 4, &address, &cycle, bits, rows, gamma,
+        )
+        .unwrap();
+
+        let eq = eq_table(&cycle);
+        let mask = (1u128 << bits) - 1;
+        let mut claim = AkitaField::zero();
+        for (row, lookup) in lookups.iter().enumerate() {
+            let mut sum = AkitaField::zero();
+            for group in 0..groups {
+                let mut product = AkitaField::one();
+                for local in 0..4 {
+                    let factor = group * 4 + local;
+                    let selector = ((lookup >> ((count - 1 - factor) * bits)) & mask) as usize;
+                    product *= chunk_tables[factor * (1 << bits) + selector];
+                }
+                sum += product;
+            }
+            claim += eq[row] * sum;
+        }
+        let binds: Vec<_> = (0..log_t)
+            .map(|round| match round {
+                1 => AkitaField::zero(),
+                2 => AkitaField::one(),
+                _ => field(997 + 37 * round as u64),
+            })
+            .collect();
+        let mut saw_dense = false;
+        let mut saw_cpu_tail = false;
+        for round in 0..log_t {
+            let bind = round.checked_sub(1).map(|previous| binds[previous]);
+            let oracle = expected.prove_round(bind, round, claim).unwrap();
+            let gpu = actual.prove_round(bind, round, claim).unwrap();
+            assert_eq!(
+                gpu.coefficients(),
+                oracle.coefficients(),
+                "round {round}, G{groups}, log_t {log_t}, inverse reuse {reuse}"
+            );
+            saw_dense |= actual
+                .sequence
+                .as_ref()
+                .is_some_and(InstructionRaSequence::is_dense);
+            saw_cpu_tail |= actual.sequence.is_none();
+            claim = oracle.evaluate(binds[round]);
+        }
+        assert!(saw_dense);
+        assert!(saw_cpu_tail);
+        expected.finish_rounds(binds[log_t - 1]).unwrap();
+        actual.finish_rounds(binds[log_t - 1]).unwrap();
+        let oracle = expected.output_claims(&claims).unwrap();
+        let gpu = actual.output_claims(&claims).unwrap();
+        assert_eq!(gpu.committed_instruction_ra.len(), count);
+        assert_eq!(
+            gpu.committed_instruction_ra,
+            oracle.committed_instruction_ra
+        );
+        let output_points = relation.derive_opening_points(&binds, &points).unwrap();
+        actual
+            .validate_derived_tables(&relation, &points, &output_points, &challenges)
+            .unwrap();
+    }
+
+    #[test]
+    fn g8_nibble_gpu_rounds_and_terminal_claims_match_cpu() {
+        for log_t in [9, 10] {
+            for gamma in [AkitaField::one(), field(271)] {
+                gpu_cpu_parity(log_t, 8, 4, gamma, false);
+            }
+        }
+    }
+
+    #[test]
+    fn g8_nibble_inverse_reuse_and_g4_byte_rounds_match_cpu() {
+        gpu_cpu_parity(10, 8, 4, field(271), true);
+        gpu_cpu_parity(9, 4, 8, field(271), false);
+        gpu_cpu_parity(10, 4, 8, AkitaField::one(), true);
+    }
+
+    #[test]
+    fn g8_nibble_zero_batching_gamma_retains_cpu_rejection() {
+        let rows = Arc::new(vec![
+            InstructionCycleRow::new(
+                0,
+                None,
+                false,
+                0,
+                None,
+                FusedInc::default()
+            );
+            128
+        ]);
+        let result = OptimizedInstructionRaVirtualizationKernel::new(
+            7,
+            8,
+            4,
+            &vec![field(31); 128],
+            &vec![field(113); 7],
+            4,
+            rows,
+            AkitaField::zero(),
+        );
+        assert!(matches!(
+            result,
+            Err(KernelError::InvariantViolation {
+                reason: "instruction RA batching gamma must be invertible"
+            })
+        ));
+    }
+
+    #[test]
+    fn production_nibble_cutoff_preserves_t22_cpu_admission() {
+        let cutoff = InstructionRaVirtualizationMetalConfig::default().trace_cutoff_elements;
+        assert_eq!(cutoff, 1 << 24);
+        assert!(1 << 22 < cutoff);
     }
 }

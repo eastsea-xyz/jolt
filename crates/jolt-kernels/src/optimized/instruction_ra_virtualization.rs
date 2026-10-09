@@ -233,9 +233,14 @@ impl<F: JoltField> InstructionRaInitialization<F> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     pub(crate) fn supports_metal_sequence(&self) -> bool {
         self.num_committed_per_virtual == 4
-            && self.committed_chunk_bits == 8
-            && self.chunk_tables.len() == 16
-            && self.chunk_tables.iter().all(|table| table.len() == 256)
+            && matches!(
+                (self.committed_chunk_bits, self.chunk_tables.len()),
+                (8, 16) | (4, 32)
+            )
+            && self
+                .chunk_tables
+                .iter()
+                .all(|table| table.len() == 1 << self.committed_chunk_bits)
     }
 
     pub(crate) fn into_cpu(
@@ -271,7 +276,7 @@ impl<F: JoltField> InstructionRaInitialization<F> {
     ) -> Result<(OptimizedInstructionRaVirtualizationKernel<F>, Vec<F>), KernelError<F>> {
         if !self.supports_metal_sequence() {
             return Err(KernelError::Unsupported {
-                reason: "instruction RA Metal sequence requires 4x4 8-bit geometry",
+                reason: "instruction RA Metal sequence requires G4 byte or G8 nibble geometry",
             });
         }
         let tables = core::mem::take(&mut self.chunk_tables);

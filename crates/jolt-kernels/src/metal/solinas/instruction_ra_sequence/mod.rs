@@ -1,4 +1,4 @@
-//! Resident lazy-prefix sequence for production-G4 Instruction RA.
+//! Resident lazy-prefix sequence for G4/byte and G8/nibble Instruction RA.
 //!
 //! The lazy prefix gathers from the stage-5 lookup plane while each bind doubles
 //! the branch tables. At the configured width, the final gather writes
@@ -17,14 +17,52 @@ use super::{
     PipelineLimits, ResidentLookupIndexPlane, SolinasMetal,
 };
 
-const FACTORS: usize = 16;
-const BINS: usize = 256;
+const G4_TABLE_VALUES: usize = 16 * 256;
+const G8_TABLE_VALUES: usize = 32 * 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Geometry {
+    groups: usize,
+    chunk_bits: usize,
+}
+
+impl Geometry {
+    fn from_table_values(values: usize) -> Result<Self, MetalError> {
+        match values {
+            G4_TABLE_VALUES => Ok(Self {
+                groups: 4,
+                chunk_bits: 8,
+            }),
+            G8_TABLE_VALUES => Ok(Self {
+                groups: 8,
+                chunk_bits: 4,
+            }),
+            _ => Err(MetalError::InvalidInstructionRaState(
+                "instruction RA requires G4 byte or G8 nibble tables",
+            )),
+        }
+    }
+
+    const fn factors(self) -> usize {
+        self.groups * 4
+    }
+    const fn bins(self) -> usize {
+        1 << self.chunk_bits
+    }
+    const fn table_values(self) -> usize {
+        self.factors() * self.bins()
+    }
+    const fn materialize_params(self) -> u32 {
+        ((self.groups as u32) << 8) | self.chunk_bits as u32
+    }
+}
 const SAMPLES: usize = 4;
 const SIMD_WIDTH: usize = 32;
 const DEFAULT_MESSAGE_THREADS: usize = 128;
 const DEFAULT_MATERIALIZE_THREADS: usize = 64;
 const BRANCH_THREADS: usize = 256;
 const MESSAGE_WIDTH_1_PIPELINE: &str = "solinas_instruction_ra_first_message";
+const NIBBLE_WIDTH_1_PIPELINE: &str = "solinas_instruction_ra_nibble_first_message";
 const MESSAGE_WIDTH_2_PIPELINE: &str = "solinas_instruction_ra_message_width_2";
 const MESSAGE_WIDTH_4_PIPELINE: &str = "solinas_instruction_ra_message_width_4";
 const MESSAGE_WIDTH_8_PIPELINE: &str = "solinas_instruction_ra_message_width_8";
@@ -106,26 +144,31 @@ impl InstructionRaSequenceConfig {
     pub fn scratch_layout(
         self,
         rows: usize,
+        chunk_table_values: usize,
     ) -> Result<InstructionRaSequenceScratchLayout, MetalError> {
+        let geometry = Geometry::from_table_values(chunk_table_values)?;
         let materialize_width = self.materialize_width.elements();
         if rows < 2 * materialize_width || !rows.is_power_of_two() {
             return Err(MetalError::InvalidInstructionRaRows(rows));
         }
-        if self.reuse_inverse_for_dense && materialize_width == 16 {
+        if self.reuse_inverse_for_dense && materialize_width < 2 * geometry.factors() {
             return Err(MetalError::InvalidInstructionRaState(
-                "the resident inverse buffer is too small for width-16 dense ping-pong",
+                "the resident inverse buffer is too small for this geometry and materialization width",
             ));
         }
         let (branch_a_width, branch_b_width) = branch_capacity_widths(materialize_width);
-        let branch_a_values = FACTORS
+        let branch_a_values = geometry
+            .factors()
             .checked_mul(branch_a_width)
-            .and_then(|values| values.checked_mul(BINS))
+            .and_then(|values| values.checked_mul(geometry.bins()))
             .ok_or(MetalError::InputTooLong(rows))?;
-        let branch_b_values = FACTORS
+        let branch_b_values = geometry
+            .factors()
             .checked_mul(branch_b_width)
-            .and_then(|values| values.checked_mul(BINS))
+            .and_then(|values| values.checked_mul(geometry.bins()))
             .ok_or(MetalError::InputTooLong(rows))?;
-        let dense_a_values = FACTORS
+        let dense_a_values = geometry
+            .factors()
             .checked_mul(rows / materialize_width)
             .ok_or(MetalError::InputTooLong(rows))?;
         let dense_b_active_values = dense_a_values / 2;
@@ -153,14 +196,18 @@ impl InstructionRaSequenceConfig {
 struct MessageParams {
     e_in_length: u32,
     e_out_length: u32,
-    _reserved: [u32; 2],
+    // Shares the common G4 first-message ABI's reserved uint2. Lazy kernels
+    // interpret these words as group count and committed chunk width.
+    geometry: [u32; 2],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BranchParams {
     branch_width: u32,
-    _reserved: [u32; 3],
+    factor_count: u32,
+    bins: u32,
+    _reserved: u32,
 }
 
 #[repr(C)]
@@ -169,7 +216,8 @@ struct MaterializeParams {
     source_elements: u32,
     e_in_length: u32,
     e_out_length: u32,
-    _reserved: u32,
+    // The Metal materialization ABI reserves one scalar: groups << 8 | bits.
+    geometry: u32,
 }
 
 struct Pipelines {
@@ -198,6 +246,7 @@ struct Buffers {
 pub(crate) struct InstructionRaSequenceStorage {
     context: SolinasMetal,
     config: InstructionRaSequenceConfig,
+    geometry: Geometry,
     pipelines: Pipelines,
     reduction_limits: PipelineLimits,
     buffers: Buffers,
@@ -223,6 +272,7 @@ impl allocative::Allocative for InstructionRaSequenceStorage {
 
 pub struct InstructionRaSequence {
     context: SolinasMetal,
+    geometry: Geometry,
     lookup_plane: Option<ResidentLookupIndexPlane>,
     pipelines: Pipelines,
     reduction_limits: PipelineLimits,
@@ -258,6 +308,42 @@ impl allocative::Allocative for InstructionRaSequence {
 }
 
 impl SolinasMetal {
+    #[cfg(test)]
+    pub(crate) fn prepare_instruction_ra_test_sequence(
+        &self,
+        lookups: &[u128],
+        chunk_tables: &[AkitaField],
+        e_in_capacity: usize,
+        e_out_capacity: usize,
+        config: InstructionRaSequenceConfig,
+    ) -> Result<InstructionRaSequence, MetalError> {
+        let rows = lookups.len();
+        if rows < 32 || !rows.is_power_of_two() {
+            return Err(MetalError::InvalidInstructionRaRows(rows));
+        }
+        // Exercise a non-identity cycle-to-table mapping as in the stage-5 scatter.
+        let mut stored = vec![[0u64; 2]; rows];
+        let mut inverse = vec![0u32; rows];
+        for (row, lookup) in lookups.iter().enumerate() {
+            let destination = row * 17 % rows;
+            stored[destination] = [*lookup as u64, (*lookup >> 64) as u64];
+            inverse[row] = destination as u32;
+        }
+        let plane = ResidentLookupIndexPlane::from_buffers(
+            super::buffer_from_slice(&self.device, &stored),
+            super::buffer_from_slice(&self.device, &inverse),
+            rows,
+            self.device_registry_id(),
+        );
+        self.prepare_instruction_ra_sequence_with_plane(
+            plane,
+            chunk_tables,
+            e_in_capacity,
+            e_out_capacity,
+            config,
+        )
+    }
+
     fn compile_instruction_ra_width_pipeline(
         &self,
         name: &'static str,
@@ -300,6 +386,7 @@ impl SolinasMetal {
             e_in_capacity,
             e_out_capacity,
             config,
+            chunk_tables.len(),
         )?;
         storage.attach(plane, chunk_tables)
     }
@@ -310,14 +397,16 @@ impl SolinasMetal {
         e_in_capacity: usize,
         e_out_capacity: usize,
         config: InstructionRaSequenceConfig,
+        chunk_table_values: usize,
     ) -> Result<InstructionRaSequenceStorage, MetalError> {
+        let geometry = Geometry::from_table_values(chunk_table_values)?;
         let materialize_width = config.materialize_width.elements();
         if rows < 2 * materialize_width || !rows.is_power_of_two() {
             return Err(MetalError::InvalidInstructionRaRows(rows));
         }
-        if config.reuse_inverse_for_dense && materialize_width == 16 {
+        if config.reuse_inverse_for_dense && materialize_width < 2 * geometry.factors() {
             return Err(MetalError::InvalidInstructionRaState(
-                "the resident inverse buffer is too small for width-16 dense ping-pong",
+                "the resident inverse buffer is too small for this geometry and materialization width",
             ));
         }
         let covered = e_in_capacity
@@ -353,8 +442,13 @@ impl SolinasMetal {
                 )?,
             )
         };
+        let width_1_name = if geometry.chunk_bits == 4 {
+            NIBBLE_WIDTH_1_PIPELINE
+        } else {
+            MESSAGE_WIDTH_1_PIPELINE
+        };
         let pipelines = Pipelines {
-            width_1: self.compile_named_pipeline(MESSAGE_WIDTH_1_PIPELINE)?,
+            width_1: self.compile_named_pipeline(width_1_name)?,
             width_2: self.compile_named_pipeline(MESSAGE_WIDTH_2_PIPELINE)?,
             width_4: self.compile_named_pipeline(MESSAGE_WIDTH_4_PIPELINE)?,
             width_8: self.compile_named_pipeline(MESSAGE_WIDTH_8_PIPELINE)?,
@@ -368,7 +462,7 @@ impl SolinasMetal {
         let materialize_limits = Self::limits(&pipelines.materialize);
         let reduction_limits = Self::limits(&pipelines.reduce);
         for (pipeline, limits) in [
-            (MESSAGE_WIDTH_1_PIPELINE, message_limits),
+            (width_1_name, message_limits),
             (MESSAGE_WIDTH_2_PIPELINE, Self::limits(&pipelines.width_2)),
             (MESSAGE_WIDTH_4_PIPELINE, Self::limits(&pipelines.width_4)),
             (MESSAGE_WIDTH_8_PIPELINE, Self::limits(&pipelines.width_8)),
@@ -410,16 +504,32 @@ impl SolinasMetal {
             Self::resolve_threadgroup_width(Some(BRANCH_THREADS), Self::limits(&pipelines.double))?;
 
         let (branch_a_width, branch_b_width) = branch_capacity_widths(materialize_width);
-        let branch_a_capacity = FACTORS * branch_a_width * BINS;
-        let branch_b_capacity = FACTORS * branch_b_width * BINS;
-        let dense_capacity = FACTORS
+        let branch_a_capacity = geometry.factors() * branch_a_width * geometry.bins();
+        let branch_b_capacity = geometry.factors() * branch_b_width * geometry.bins();
+        let dense_capacity = geometry
+            .factors()
             .checked_mul(rows / materialize_width)
             .ok_or(MetalError::InputTooLong(rows))?;
         let partial_capacity = SAMPLES
             .checked_mul(e_out_capacity)
             .ok_or(MetalError::InputTooLong(e_out_capacity))?;
+        let scratch = config.scratch_layout(rows, chunk_table_values)?;
+        let extra_fields = e_in_capacity
+            .checked_add(e_out_capacity)
+            .and_then(|n| {
+                partial_capacity
+                    .checked_mul(2)
+                    .and_then(|p| n.checked_add(p))
+            })
+            .ok_or(MetalError::InputTooLong(rows))?;
+        let owned_bytes = scratch
+            .owned_bytes()
+            .checked_add(byte_length::<Fp128>(extra_fields)?)
+            .ok_or(MetalError::InputTooLong(rows))?;
+        self.validate_additional_working_set(owned_bytes)?;
         Ok(InstructionRaSequenceStorage {
             context: self.clone(),
+            geometry,
             pipelines,
             reduction_limits,
             buffers: Buffers {
@@ -455,12 +565,14 @@ impl InstructionRaSequenceStorage {
         e_in_capacity: usize,
         e_out_capacity: usize,
         config: InstructionRaSequenceConfig,
+        chunk_table_values: usize,
     ) -> bool {
         self.context.device_registry_id() == context.device_registry_id()
             && self.rows == rows
             && self.e_in_capacity == e_in_capacity
             && self.e_out_capacity == e_out_capacity
             && self.config == config
+            && self.geometry.table_values() == chunk_table_values
     }
 
     pub(crate) fn attach(
@@ -473,17 +585,22 @@ impl InstructionRaSequenceStorage {
                 "resident lookup plane does not match the preallocated sequence",
             ));
         }
-        if chunk_tables.len() != FACTORS * BINS {
+        if chunk_tables.len() != self.geometry.table_values() {
             return Err(MetalError::InstructionRaStorageLength {
-                expected: FACTORS * BINS,
+                expected: self.geometry.table_values(),
                 got: chunk_tables.len(),
             });
         }
         validate_plane(&self.context, &plane)?;
-        write_fields(&self.buffers.branches_a, FACTORS * BINS, chunk_tables)?;
+        write_fields(
+            &self.buffers.branches_a,
+            self.geometry.table_values(),
+            chunk_tables,
+        )?;
         if self.buffers.dense_b.is_none() {
             let required = byte_length::<Fp128>(
-                FACTORS * (self.rows / self.config.materialize_width.elements()) / 2,
+                self.geometry.factors() * (self.rows / self.config.materialize_width.elements())
+                    / 2,
             )?;
             let inverse = plane.cycle_to_table_major();
             if inverse.length() < required {
@@ -497,6 +614,7 @@ impl InstructionRaSequenceStorage {
 
         Ok(InstructionRaSequence {
             context: self.context,
+            geometry: self.geometry,
             lookup_plane: Some(plane),
             pipelines: self.pipelines,
             reduction_limits: self.reduction_limits,
@@ -566,7 +684,7 @@ impl InstructionRaSequence {
                 "lazy tables cannot be read as dense tables",
             ));
         }
-        let elements = FACTORS * self.dense_elements;
+        let elements = self.geometry.factors() * self.dense_elements;
         if output.len() != elements {
             return Err(MetalError::InstructionRaStorageLength {
                 expected: elements,
@@ -632,14 +750,14 @@ impl InstructionRaSequence {
                 .map_err(|_| MetalError::InputTooLong(e_in.len()))?,
             e_out_length: u32::try_from(e_out.len())
                 .map_err(|_| MetalError::InputTooLong(e_out.len()))?,
-            _reserved: [0; 2],
+            geometry: [self.geometry.groups as u32, self.geometry.chunk_bits as u32],
         };
         let materialize_params = MaterializeParams {
             source_elements: u32::try_from(source_elements)
                 .map_err(|_| MetalError::InputTooLong(source_elements))?,
             e_in_length: message_params.e_in_length,
             e_out_length: message_params.e_out_length,
-            _reserved: 0,
+            geometry: self.geometry.materialize_params(),
         };
         let message_pipeline = if materialize {
             None
@@ -661,14 +779,16 @@ impl InstructionRaSequence {
             if let Some(challenge) = challenge {
                 let params = BranchParams {
                     branch_width: self.branch_width as u32,
-                    _reserved: [0; 3],
+                    factor_count: self.geometry.factors() as u32,
+                    bins: self.geometry.bins() as u32,
+                    _reserved: 0,
                 };
                 encoder.set_compute_pipeline_state(&self.pipelines.double);
                 encoder.set_buffer(0, Some(self.branch_source_buffer()), 0);
                 encoder.set_buffer(1, Some(self.branch_destination_buffer()), 0);
                 set_inline_bytes(encoder, 2, &Fp128::from_jolt_field(&challenge));
                 set_inline_bytes(encoder, 3, &params);
-                let elements = FACTORS * self.branch_width * BINS;
+                let elements = self.geometry.factors() * self.branch_width * self.geometry.bins();
                 encoder.dispatch_thread_groups(
                     MTLSize {
                         width: elements.div_ceil(self.branch_threads_per_threadgroup) as u64,
@@ -779,7 +899,7 @@ impl InstructionRaSequence {
                 .map_err(|_| MetalError::InputTooLong(e_in.len()))?,
             e_out_length: u32::try_from(e_out.len())
                 .map_err(|_| MetalError::InputTooLong(e_out.len()))?,
-            _reserved: 0,
+            geometry: self.geometry.materialize_params(),
         };
 
         let queue = self.context.queue.clone();
@@ -1026,6 +1146,7 @@ const _: () = assert!(size_of::<MaterializeParams>() == 16);
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test assertions")]
+#[expect(clippy::unwrap_used, reason = "GPU geometry fixtures")]
 mod tests {
     use jolt_field::Prime128OffsetA7F7 as AkitaField;
     use jolt_field::Zero as _;
@@ -1067,7 +1188,7 @@ mod tests {
                 ..InstructionRaSequenceConfig::default()
             };
             let layout = config
-                .scratch_layout(1 << 26)
+                .scratch_layout(1 << 26, G4_TABLE_VALUES)
                 .expect("the T26 layout should fit");
             assert_eq!(layout.owned_bytes() >> 20, expected_mib);
         }
@@ -1081,7 +1202,7 @@ mod tests {
             ..InstructionRaSequenceConfig::default()
         };
         let layout = config
-            .scratch_layout(1 << 26)
+            .scratch_layout(1 << 26, G4_TABLE_VALUES)
             .expect("the T26 layout should fit");
         assert_eq!(layout.dense_b_active_bytes >> 20, 32);
         assert_eq!(layout.dense_b_owned_bytes, 0);
@@ -1091,13 +1212,58 @@ mod tests {
     }
 
     #[test]
+    fn g8_t24_w64_bounds_dense_scratch_and_inverse_reuse() {
+        let config = InstructionRaSequenceConfig {
+            materialize_width: InstructionRaMaterializeWidth::W64,
+            ..Default::default()
+        };
+        let layout = config.scratch_layout(1 << 24, G8_TABLE_VALUES).unwrap();
+        assert_eq!(layout.dense_a_bytes, 128 << 20);
+        assert_eq!(layout.dense_b_owned_bytes, 64 << 20);
+        assert_eq!(layout.branch_a_bytes + layout.branch_b_bytes, 768 << 10);
+        assert_eq!(layout.owned_bytes(), (192 << 20) + (768 << 10));
+        let reused = InstructionRaSequenceConfig {
+            reuse_inverse_for_dense: true,
+            ..config
+        }
+        .scratch_layout(1 << 24, G8_TABLE_VALUES)
+        .unwrap();
+        assert_eq!(reused.dense_b_owned_bytes, 0);
+        assert_eq!(reused.dense_b_physical_bytes, 64 << 20);
+        assert!(InstructionRaSequenceConfig {
+            materialize_width: InstructionRaMaterializeWidth::W32,
+            reuse_inverse_for_dense: true,
+            ..Default::default()
+        }
+        .scratch_layout(1 << 24, G8_TABLE_VALUES)
+        .is_err());
+        assert!(config.scratch_layout(1 << 24, 123).is_err());
+    }
+
+    #[test]
+    fn preallocated_storage_does_not_match_a_different_geometry() {
+        let rows = 1 << 8;
+        let context = SolinasMetal::for_akita().unwrap();
+        let (e_in, e_out) = instruction_ra_weight_capacities(rows).unwrap();
+        let config = InstructionRaSequenceConfig {
+            materialize_width: InstructionRaMaterializeWidth::W64,
+            ..Default::default()
+        };
+        let storage = context
+            .prepare_instruction_ra_sequence_storage(rows, e_in, e_out, config, G4_TABLE_VALUES)
+            .unwrap();
+        assert!(storage.matches(&context, rows, e_in, e_out, config, G4_TABLE_VALUES));
+        assert!(!storage.matches(&context, rows, e_in, e_out, config, G8_TABLE_VALUES));
+    }
+
+    #[test]
     fn width_16_rejects_inverse_reuse() {
         let config = InstructionRaSequenceConfig {
             reuse_inverse_for_dense: true,
             ..InstructionRaSequenceConfig::default()
         };
         assert!(matches!(
-            config.scratch_layout(1 << 26),
+            config.scratch_layout(1 << 26, G4_TABLE_VALUES),
             Err(MetalError::InvalidInstructionRaState(_))
         ));
     }
@@ -1118,6 +1284,7 @@ mod tests {
                     reuse_inverse_for_dense: true,
                     ..InstructionRaSequenceConfig::default()
                 },
+                G4_TABLE_VALUES,
             )
             .expect("wide Instruction RA pipelines should compile");
     }

@@ -3,7 +3,9 @@
 
 struct InstructionRaBranchParams {
     uint branch_width;
-    uint3 reserved;
+    uint factor_count;
+    uint bins;
+    uint reserved;
 };
 
 struct InstructionRaMaterializeParams {
@@ -15,10 +17,20 @@ struct InstructionRaMaterializeParams {
 
 constant uint instruction_ra_wide_branch_width [[function_constant(0)]];
 
+inline uint instruction_ra_sequence_selector(
+    InstructionRaLookup lookup, uint factor, uint groups, uint chunk_bits)
+{
+    uint shift = (groups * INSTRUCTION_RA_FACTORS_PER_GROUP - 1u - factor) * chunk_bits;
+    ulong limb = shift < 64u ? lookup.limbs[0] : lookup.limbs[1];
+    return (uint)(limb >> (shift & 63u)) & ((1u << chunk_bits) - 1u);
+}
+
 inline void instruction_ra_gather_group(
     uint group,
     uint pair,
     uint branch_width,
+    uint groups,
+    uint chunk_bits,
     device const InstructionRaLookup* lookups,
     device const uint* cycle_to_table_major,
     device const SolinasFp128* branches,
@@ -30,6 +42,7 @@ inline void instruction_ra_gather_group(
     }
 
     uint original = 2u * pair * branch_width;
+    uint bins = 1u << chunk_bits;
     for (uint offset = 0; offset < branch_width; offset++) {
         uint lo_row = cycle_to_table_major[original + offset];
         uint hi_row = cycle_to_table_major[original + branch_width + offset];
@@ -37,13 +50,13 @@ inline void instruction_ra_gather_group(
         InstructionRaLookup hi_lookup = lookups[hi_row];
         for (uint local = 0; local < INSTRUCTION_RA_FACTORS_PER_GROUP; local++) {
             uint factor = group * INSTRUCTION_RA_FACTORS_PER_GROUP + local;
-            uint table = (factor * branch_width + offset) * INSTRUCTION_RA_BINS;
+            uint table = (factor * branch_width + offset) * bins;
             factors[local].at_infinity = solinas_add(
                 factors[local].at_infinity,
-                branches[table + instruction_ra_lookup_byte(lo_lookup, factor)]);
+                branches[table + instruction_ra_sequence_selector(lo_lookup, factor, groups, chunk_bits)]);
             factors[local].at_one = solinas_add(
                 factors[local].at_one,
-                branches[table + instruction_ra_lookup_byte(hi_lookup, factor)]);
+                branches[table + instruction_ra_sequence_selector(hi_lookup, factor, groups, chunk_bits)]);
         }
     }
 
@@ -100,12 +113,14 @@ inline void instruction_ra_lazy_message_body(
         for (uint sample = 0; sample < INSTRUCTION_RA_SAMPLES; sample++) {
             q[sample] = solinas_zero();
         }
-        for (uint group = 0; group < INSTRUCTION_RA_GROUPS; group++) {
+        for (uint group = 0; group < params.reserved.x; group++) {
             InstructionRaLinear factors[INSTRUCTION_RA_FACTORS_PER_GROUP];
             instruction_ra_gather_group(
                 group,
                 pair,
                 branch_width,
+                params.reserved.x,
+                params.reserved.y,
                 lookups,
                 cycle_to_table_major,
                 branches,
@@ -152,6 +167,7 @@ kernel void NAME( \
         params, shared, x_in_thread, x_out, lane_in_simd, simdgroup, threads); \
 }
 
+DEFINE_INSTRUCTION_RA_MESSAGE_KERNEL(solinas_instruction_ra_nibble_first_message, 1u)
 DEFINE_INSTRUCTION_RA_MESSAGE_KERNEL(solinas_instruction_ra_message_width_2, 2u)
 DEFINE_INSTRUCTION_RA_MESSAGE_KERNEL(solinas_instruction_ra_message_width_4, 4u)
 DEFINE_INSTRUCTION_RA_MESSAGE_KERNEL(solinas_instruction_ra_message_width_8, 8u)
@@ -166,8 +182,8 @@ kernel void solinas_instruction_ra_double_branches(
     constant InstructionRaBranchParams& params [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint per_factor = params.branch_width * INSTRUCTION_RA_BINS;
-    uint elements = INSTRUCTION_RA_FACTORS * per_factor;
+    uint per_factor = params.branch_width * params.bins;
+    uint elements = params.factor_count * per_factor;
     if (gid >= elements) {
         return;
     }
@@ -212,12 +228,14 @@ inline void instruction_ra_materialize_body(
         for (uint sample = 0; sample < INSTRUCTION_RA_SAMPLES; sample++) {
             q[sample] = solinas_zero();
         }
-        for (uint group = 0; group < INSTRUCTION_RA_GROUPS; group++) {
+        for (uint group = 0; group < (params.reserved >> 8u); group++) {
             InstructionRaLinear factors[INSTRUCTION_RA_FACTORS_PER_GROUP];
             instruction_ra_gather_group(
                 group,
                 pair,
                 branch_width,
+                params.reserved >> 8u,
+                params.reserved & 0xffu,
                 lookups,
                 cycle_to_table_major,
                 branches,
@@ -346,7 +364,7 @@ kernel void solinas_instruction_ra_dense_transition(
         for (uint sample = 0; sample < INSTRUCTION_RA_SAMPLES; sample++) {
             q[sample] = solinas_zero();
         }
-        for (uint group = 0; group < INSTRUCTION_RA_GROUPS; group++) {
+        for (uint group = 0; group < (params.reserved >> 8u); group++) {
             InstructionRaLinear factors[INSTRUCTION_RA_FACTORS_PER_GROUP];
             for (uint local = 0; local < INSTRUCTION_RA_FACTORS_PER_GROUP; local++) {
                 uint factor = group * INSTRUCTION_RA_FACTORS_PER_GROUP + local;
