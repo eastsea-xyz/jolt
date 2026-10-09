@@ -864,6 +864,16 @@ impl SolinasMetal {
 }
 
 impl AddressPhaseSequence {
+    pub(crate) fn into_product9_source(
+        self,
+    ) -> Result<super::Product9ResidentSource, super::product9::Product9Error> {
+        super::Product9ResidentSource::new(
+            &self.context,
+            self.buffers.packed_rows.clone(),
+            self.resident_lookup_index_plane(),
+        )
+    }
+
     pub(crate) fn resident_lookup_index_plane(&self) -> ResidentLookupIndexPlane {
         ResidentLookupIndexPlane::from_buffers(
             self.buffers.lookups.clone(),

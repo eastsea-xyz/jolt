@@ -4,12 +4,13 @@ use std::thread::JoinHandle;
 use jolt_claims::protocols::jolt::JoltCommittedPolynomial;
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
 use jolt_field::Zero as _;
-use jolt_sumcheck::{ProveRounds, SumcheckError};
+use jolt_sumcheck::{ProveRounds, RoundExecutionDomain, SumcheckError};
 use jolt_verifier::stages::relations::SumcheckInputClaims;
 use jolt_verifier::stages::stage5::InstructionReadRaf;
 use jolt_witness::{JoltWitnessPlane, PolynomialEncoding};
 
 use super::backend::MetalBackend;
+use super::instruction_read_raf_product9::Product9CycleAdapter;
 use super::solinas::bytecode_read_raf_address::{
     BytecodeAddressFusedScatterRequest, BytecodeAddressSparseStage1Carrier,
     BytecodeAddressStage1TopologyOwner,
@@ -669,6 +670,7 @@ pub(crate) struct MetalInstructionReadRafKernel {
     address_sequence: Option<Box<AddressPhaseSequence>>,
     resident_lookup_plane: Option<ResidentLookupIndexPlane>,
     sequence: Option<Product5Sequence>,
+    product9: Option<Product9CycleAdapter>,
     host_tail: Option<[Vec<AkitaField>; PRODUCT5_FACTORS]>,
     metal_rounds: usize,
     metal_address_phases: usize,
@@ -698,6 +700,7 @@ impl MetalInstructionReadRafKernel {
             address_sequence: None,
             resident_lookup_plane: None,
             sequence: None,
+            product9: None,
             host_tail: Some(std::array::from_fn(|_| {
                 vec![AkitaField::zero(); config.cutoff_elements]
             })),
@@ -808,6 +811,20 @@ impl MetalInstructionReadRafKernel {
 }
 
 impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
+    fn execution_domain(&self) -> RoundExecutionDomain {
+        if let Some(adapter) = &self.product9 {
+            return adapter.execution_domain();
+        }
+        // Scheduling happens before prove_round installs Product9. The retained
+        // T24 address carrier also launches GPU work at that first-cycle seam.
+        if self.address_sequence.is_some()
+            && self.resident_lookup_plane.as_ref().is_some_and(|plane| plane.len() == 1 << 24)
+        {
+            return RoundExecutionDomain::Accelerator;
+        }
+        RoundExecutionDomain::Host
+    }
+
     fn num_rounds(&self) -> usize {
         self.cpu.num_rounds()
     }
@@ -830,6 +847,25 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
             if self.cpu.metal_address_active() {
                 return self.cpu.metal_address_message(previous_claim);
             }
+        }
+
+        if self.product9.is_none()
+            && self.address_sequence.is_some()
+            && self.cpu.metal_product9_cycle_available()
+            && self.resident_lookup_plane.as_ref().is_some_and(|plane| plane.len() == 1 << 24)
+        {
+            let address = self.address_sequence.take()
+                .ok_or_else(|| backend_error("Product9 address source disappeared"))?;
+            let source = (*address).into_product9_source()
+                .map_err(|error| backend_error(error.to_string()))?;
+            let adapter = Product9CycleAdapter::prepare(
+                &mut self.cpu, self.context.as_ref().clone(), source, self.config.cutoff_elements,
+            )?;
+            self.host_tail = None; // Release the unused Product5 CPU-tail reservation.
+            self.product9 = Some(adapter);
+        }
+        if let Some(adapter) = self.product9.as_mut() {
+            return adapter.prove_round(&mut self.cpu, bind, round, previous_claim);
         }
 
         if self.address_sequence.is_some() && !self.cpu.metal_resident_cycle_available() {
@@ -916,6 +952,7 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
     }
 
     fn finish_rounds(&mut self, bind: AkitaField) -> Result<(), SumcheckError<AkitaField>> {
+        if let Some(adapter) = self.product9.as_mut() { adapter.restore(&mut self.cpu)?; }
         if self.sequence.is_some() {
             self.restore_cpu_tail()?;
         }

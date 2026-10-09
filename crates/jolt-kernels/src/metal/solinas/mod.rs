@@ -57,6 +57,7 @@ mod instruction_ra_sequence;
 mod instruction_read_raf;
 mod outer_remainder;
 mod product5;
+mod product9;
 mod product_remainder;
 mod product_uniskip;
 #[doc(hidden)]
@@ -839,3 +840,5 @@ mod tests {
         assert!(!Fp128::ZERO.is_canonical(0));
     }
 }
+
+pub(crate) use product9::{Product9CycleInput, Product9ResidentSource, Product9Sequence};
