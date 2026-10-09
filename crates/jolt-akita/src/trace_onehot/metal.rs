@@ -123,10 +123,14 @@ impl<const D: usize> OpeningFoldKernel<TracePackedOneHotView<'_, D>, AkitaField,
         source: TracePackedOneHotView<'_, D>,
         plan: DecomposeFoldPlan<'_>,
     ) -> Result<DecomposeFoldWitness<AkitaField>, AkitaError> {
-        if !matches!(D, 128 | 512)
-            || source.source().one_hot_k != 256
-            || source.source().column_capacity != 32
-        {
+        if !matches!(
+            (
+                source.source().one_hot_k,
+                source.source().column_capacity,
+                D
+            ),
+            (16, 64, 64 | 128 | 256 | 512) | (256, 32, 128 | 512)
+        ) {
             self.record_opening_cpu_fallback(1)
                 .map_err(|error| AkitaError::InvalidInput(error.to_string()))?;
             return CpuBackend::DEFAULT.decompose_fold(None, source, plan);
@@ -146,10 +150,14 @@ impl<const D: usize> OpeningBatchKernel<TracePackedOneHotBatchView<'_, D>, Akita
         source: TracePackedOneHotBatchView<'_, D>,
         plan: DecomposeFoldBatchPlan<'_>,
     ) -> Result<BatchDecomposeFoldOutcome<AkitaField, D>, AkitaError> {
-        if !matches!(D, 128 | 512)
-            || source.source().one_hot_k != 256
-            || source.source().column_capacity != 32
-        {
+        if !matches!(
+            (
+                source.source().one_hot_k,
+                source.source().column_capacity,
+                D
+            ),
+            (16, 64, 64 | 128 | 256 | 512) | (256, 32, 128 | 512)
+        ) {
             self.record_opening_cpu_fallback(1)
                 .map_err(|error| AkitaError::InvalidInput(error.to_string()))?;
             return CpuBackend::DEFAULT.decompose_fold_batch(None, source, plan);
