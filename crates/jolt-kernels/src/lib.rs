@@ -47,6 +47,7 @@ pub use metal::profiling as metal_profiling;
 pub mod opening;
 pub mod optimized;
 pub mod precommitted_reduction;
+pub mod profiling_memory;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod ram_access;
 pub mod reference;
