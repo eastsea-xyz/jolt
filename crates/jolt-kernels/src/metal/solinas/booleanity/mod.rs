@@ -5,6 +5,7 @@ use super::{
     Fp128, MetalError, PipelineLimits, SolinasMetal,
 };
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
+#[cfg(test)]
 use jolt_field::Zero as _;
 use metal::{
     foreign_types::ForeignType, objc::rc::autoreleasepool, Buffer, ComputePipelineState,
@@ -18,6 +19,9 @@ const LAZY_PIPELINE: &str = "solinas_booleanity_lazy_message";
 const DOUBLE_PIPELINE: &str = "solinas_booleanity_double_branches";
 const DENSE_PIPELINE: &str = "solinas_booleanity_dense_transition";
 const REDUCE_PIPELINE: &str = "solinas_booleanity_reduce";
+const CONSTANT_PIPELINE: &str = "solinas_booleanity_initial_constant";
+const WEIGHT_PIPELINE: &str = "solinas_booleanity_shrink_weights";
+const FINISH_PIPELINE: &str = "solinas_booleanity_finish_bind";
 
 const PACKED_PC_MASK: u64 = (1 << 56) - 1;
 const PACKED_BYTECODE_CHUNK_RANK_LOW_SHIFT: u32 = 56;
@@ -321,6 +325,8 @@ struct Params {
     materialize: u32,
     inc_bias: u64,
     chunk_bits: u32,
+    e_in_offset: u32,
+    e_out_offset: u32,
     reserved: u32,
 }
 
@@ -330,6 +336,15 @@ struct BranchParams {
     polys: u32,
     k: u32,
     branch_width: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WeightParams {
+    source_offset: u32,
+    destination_offset: u32,
+    elements: u32,
     reserved: u32,
 }
 
@@ -353,6 +368,9 @@ pub struct BooleanitySequence {
     lazy_pipeline: ComputePipelineState,
     double_pipeline: ComputePipelineState,
     dense_pipeline: ComputePipelineState,
+    constant_pipeline: ComputePipelineState,
+    weight_pipeline: ComputePipelineState,
+    finish_pipeline: ComputePipelineState,
     reduction_pipeline: ComputePipelineState,
     reduction_limits: PipelineLimits,
     buffers: Buffers,
@@ -364,6 +382,7 @@ pub struct BooleanitySequence {
     threads_per_threadgroup: usize,
     dense_threads_per_threadgroup: usize,
     double_threads_per_threadgroup: usize,
+    field_threads_per_threadgroup: usize,
     e_in_capacity: usize,
     e_out_capacity: usize,
     branch_width: usize,
@@ -372,7 +391,12 @@ pub struct BooleanitySequence {
     dense: bool,
     dense_elements: usize,
     dense_source_in_a: bool,
-    rho_values: Vec<AkitaField>,
+    initial_constant_ready: bool,
+    weights_ready: bool,
+    e_in_length: usize,
+    e_out_length: usize,
+    e_in_offset: usize,
+    e_out_offset: usize,
 }
 
 impl SolinasMetal {
@@ -509,10 +533,16 @@ impl SolinasMetal {
         let double_pipeline = self.compile_named_pipeline(DOUBLE_PIPELINE)?;
         let dense_pipeline = self.compile_named_pipeline(DENSE_PIPELINE)?;
         let reduction_pipeline = self.compile_named_pipeline(REDUCE_PIPELINE)?;
+        let constant_pipeline = self.compile_named_pipeline(CONSTANT_PIPELINE)?;
+        let weight_pipeline = self.compile_named_pipeline(WEIGHT_PIPELINE)?;
+        let finish_pipeline = self.compile_named_pipeline(FINISH_PIPELINE)?;
         let lazy_limits = Self::limits(&lazy_pipeline);
         let double_limits = Self::limits(&double_pipeline);
         let dense_limits = Self::limits(&dense_pipeline);
         let reduction_limits = Self::limits(&reduction_pipeline);
+        let constant_limits = Self::limits(&constant_pipeline);
+        let weight_limits = Self::limits(&weight_pipeline);
+        let finish_limits = Self::limits(&finish_pipeline);
         for (pipeline, limits) in [
             (LAZY_PIPELINE, lazy_limits),
             (DOUBLE_PIPELINE, double_limits),
@@ -537,6 +567,10 @@ impl SolinasMetal {
         )?;
         let double_threads_per_threadgroup =
             Self::resolve_threadgroup_width(Some(256), double_limits)?;
+        let field_threads_per_threadgroup =
+            Self::resolve_threadgroup_width(Some(128), constant_limits)?
+                .min(Self::resolve_threadgroup_width(Some(128), weight_limits)?)
+                .min(Self::resolve_threadgroup_width(Some(128), finish_limits)?);
 
         let branch_capacity = selectors
             .len()
@@ -557,6 +591,8 @@ impl SolinasMetal {
         let partial_elements = MESSAGE_LANES
             .checked_mul(e_out_capacity)
             .ok_or(MetalError::InputTooLong(e_out_capacity))?;
+        let e_in_elements = weight_storage_elements(e_in_capacity)?;
+        let e_out_elements = weight_storage_elements(e_out_capacity)?;
         for bytes in [
             byte_length::<BooleanityRow>(rows_len)?,
             byte_length::<SelectorAbi>(selector_abi.len())?,
@@ -565,8 +601,8 @@ impl SolinasMetal {
             byte_length::<Fp128>(branch_capacity)?,
             byte_length::<Fp128>(dense_a_elements)?,
             byte_length::<Fp128>(dense_b_elements)?,
-            byte_length::<Fp128>(e_in_capacity)?,
-            byte_length::<Fp128>(e_out_capacity)?,
+            byte_length::<Fp128>(e_in_elements)?,
+            byte_length::<Fp128>(e_out_elements)?,
             byte_length::<Fp128>(partial_elements)?,
         ] {
             self.validate_buffer_length(bytes)?;
@@ -580,7 +616,6 @@ impl SolinasMetal {
         let rho_buffer = self.new_booleanity_buffer(rho.len())?;
         write_fields(&rho_buffer, rho.len(), rho)?;
         let initial_constant = self.new_booleanity_buffer(initial_constant_elements)?;
-        write_initial_constant_table(&initial_constant, base_tables, rho, k)?;
         let branches_a = self.new_booleanity_buffer(branch_capacity)?;
         write_fields(&branches_a, branch_capacity, base_tables)?;
 
@@ -589,6 +624,9 @@ impl SolinasMetal {
             lazy_pipeline,
             double_pipeline,
             dense_pipeline,
+            constant_pipeline,
+            weight_pipeline,
+            finish_pipeline,
             reduction_pipeline,
             reduction_limits,
             buffers: Buffers {
@@ -600,8 +638,8 @@ impl SolinasMetal {
                 branches_b: self.new_booleanity_buffer(branch_capacity)?,
                 dense_a: self.new_booleanity_buffer(dense_a_elements)?,
                 dense_b: self.new_booleanity_buffer(dense_b_elements)?,
-                e_in: self.new_booleanity_buffer(e_in_capacity)?,
-                e_out: self.new_booleanity_buffer(e_out_capacity)?,
+                e_in: self.new_booleanity_buffer(e_in_elements)?,
+                e_out: self.new_booleanity_buffer(e_out_elements)?,
                 partial_a: self.new_booleanity_buffer(partial_elements)?,
                 partial_b: self.new_booleanity_buffer(partial_elements)?,
             },
@@ -613,6 +651,7 @@ impl SolinasMetal {
             threads_per_threadgroup,
             dense_threads_per_threadgroup,
             double_threads_per_threadgroup,
+            field_threads_per_threadgroup,
             e_in_capacity,
             e_out_capacity,
             branch_width: 1,
@@ -621,7 +660,12 @@ impl SolinasMetal {
             dense: false,
             dense_elements: 0,
             dense_source_in_a: true,
-            rho_values: rho.to_vec(),
+            initial_constant_ready: false,
+            weights_ready: false,
+            e_in_length: e_in_capacity,
+            e_out_length: e_out_capacity,
+            e_in_offset: 0,
+            e_out_offset: 0,
         })
     }
 
@@ -645,7 +689,9 @@ impl BooleanitySequence {
                 "a dense sequence has no unbound message entry",
             ));
         }
-        self.execute_lazy(None, e_in, e_out)
+        self.validate_weights(self.current_elements() / 2, e_in.len(), e_out.len())?;
+        self.write_current_weights(e_in, e_out)?;
+        self.execute_lazy(None, e_in.len(), e_out.len(), [None, None])
     }
 
     pub fn bind_and_message(
@@ -654,10 +700,30 @@ impl BooleanitySequence {
         e_in: &[AkitaField],
         e_out: &[AkitaField],
     ) -> Result<[AkitaField; MESSAGE_LANES], MetalError> {
+        self.validate_weights(self.current_elements() / 4, e_in.len(), e_out.len())?;
+        self.write_current_weights(e_in, e_out)?;
         if self.dense {
-            self.execute_dense(challenge, e_in, e_out)
+            self.execute_dense(challenge, e_in.len(), e_out.len(), [None, None])
         } else {
-            self.execute_lazy(Some(challenge), e_in, e_out)
+            self.execute_lazy(Some(challenge), e_in.len(), e_out.len(), [None, None])
+        }
+    }
+
+    /// Use the split-equality roots from the first message. Every bind
+    /// appends the next cached equality level on device; no weight values
+    /// or polynomial tables cross the boundary during a round.
+    pub fn bind_and_message_resident(
+        &mut self,
+        challenge: AkitaField,
+        e_in_length: usize,
+        e_out_length: usize,
+    ) -> Result<[AkitaField; MESSAGE_LANES], MetalError> {
+        self.validate_weights(self.current_elements() / 4, e_in_length, e_out_length)?;
+        let transitions = self.prepare_resident_weights(e_in_length, e_out_length)?;
+        if self.dense {
+            self.execute_dense(challenge, e_in_length, e_out_length, transitions)
+        } else {
+            self.execute_lazy(Some(challenge), e_in_length, e_out_length, transitions)
         }
     }
 
@@ -672,18 +738,62 @@ impl BooleanitySequence {
         }
         let branch_capacity = self.polys * self.materialize_width * self.k;
         write_fields(&self.buffers.branches_a, branch_capacity, base_tables)?;
-        write_initial_constant_table(
-            &self.buffers.initial_constant,
-            base_tables,
-            &self.rho_values,
-            self.k,
-        )?;
         self.branch_width = 1;
         self.branches_in_a = true;
         self.dense = false;
         self.dense_elements = 0;
         self.dense_source_in_a = true;
+        self.initial_constant_ready = false;
+        self.weights_ready = false;
+        self.e_in_length = self.e_in_capacity;
+        self.e_out_length = self.e_out_capacity;
+        self.e_in_offset = 0;
+        self.e_out_offset = 0;
         Ok(())
+    }
+
+    /// Finish the last low-to-high bind without downloading a polynomial
+    /// tail. Only one value per polynomial is exposed after this command.
+    pub fn finish_bind(&mut self, challenge: AkitaField) -> Result<(), MetalError> {
+        if !self.dense || self.dense_elements != 2 {
+            return Err(MetalError::InvalidBooleanityState(
+                "the terminal bind requires two resident values per polynomial",
+            ));
+        }
+        let params = BranchParams {
+            polys: u32::try_from(self.polys).map_err(|_| MetalError::InputTooLong(self.polys))?,
+            k: 0,
+            branch_width: 0,
+            reserved: 0,
+        };
+        let queue = self.context.queue.clone();
+        let command_buffer = queue.new_command_buffer();
+        autoreleasepool(|| {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.finish_pipeline);
+            encoder.set_buffer(0, Some(self.dense_source_buffer()), 0);
+            encoder.set_buffer(1, Some(self.dense_destination_buffer()), 0);
+            set_inline_bytes(encoder, 2, &Fp128::from_jolt_field(&challenge));
+            set_inline_bytes(encoder, 3, &params);
+            self.encode_field_dispatch(encoder, self.polys);
+            encoder.end_encoding();
+            command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
+            command_buffer.wait_until_completed();
+        });
+        validate_completed_command(command_buffer)?;
+        self.dense_elements = 1;
+        self.dense_source_in_a = !self.dense_source_in_a;
+        Ok(())
+    }
+
+    pub fn read_terminal_values(&self, output: &mut [AkitaField]) -> Result<(), MetalError> {
+        if !self.dense || self.dense_elements != 1 {
+            return Err(MetalError::InvalidBooleanityState(
+                "terminal values require the final resident bind",
+            ));
+        }
+        self.read_current_tables(output)
     }
 
     pub fn read_current_tables(&self, output: &mut [AkitaField]) -> Result<(), MetalError> {
@@ -736,8 +846,9 @@ impl BooleanitySequence {
     fn execute_lazy(
         &mut self,
         challenge: Option<AkitaField>,
-        e_in: &[AkitaField],
-        e_out: &[AkitaField],
+        e_in_length: usize,
+        e_out_length: usize,
+        weight_transitions: [Option<WeightParams>; 2],
     ) -> Result<[AkitaField; MESSAGE_LANES], MetalError> {
         let next_width = if challenge.is_some() {
             self.branch_width * 2
@@ -750,14 +861,13 @@ impl BooleanitySequence {
             ));
         }
         let source_elements = self.rows / next_width;
-        self.validate_weights(source_elements / 2, e_in, e_out)?;
-        self.write_weights(e_in, e_out)?;
+        self.validate_weights(source_elements / 2, e_in_length, e_out_length)?;
         let materialize = next_width == self.materialize_width;
         let params = self.params(
             source_elements,
             next_width,
-            e_in.len(),
-            e_out.len(),
+            e_in_length,
+            e_out_length,
             materialize,
         )?;
 
@@ -765,6 +875,8 @@ impl BooleanitySequence {
         let command_buffer = queue.new_command_buffer();
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
+            self.encode_initial_constant(encoder);
+            self.encode_weight_transitions(encoder, weight_transitions);
             let mut message_branches_in_a = self.branches_in_a;
             if let Some(challenge) = challenge {
                 let branch_params = BranchParams {
@@ -805,13 +917,13 @@ impl BooleanitySequence {
             encoder.set_buffer(7, Some(&self.buffers.partial_a), 0);
             encoder.set_buffer(8, Some(&self.buffers.initial_constant), 0);
             set_inline_bytes(encoder, 9, &params);
-            Self::encode_message_dispatch(encoder, e_out.len(), self.threads_per_threadgroup);
+            Self::encode_message_dispatch(encoder, e_out_length, self.threads_per_threadgroup);
             let final_in_a = encode_column_reductions(
                 encoder,
                 &self.reduction_pipeline,
                 &self.buffers.partial_a,
                 &self.buffers.partial_b,
-                e_out.len(),
+                e_out_length,
                 MESSAGE_LANES,
                 self.reduction_limits.thread_execution_width,
             )?;
@@ -822,6 +934,7 @@ impl BooleanitySequence {
             Ok::<bool, MetalError>(final_in_a)
         })?;
         let message = self.finish_command(command_buffer, final_in_a)?;
+        self.initial_constant_ready = true;
         if challenge.is_some() {
             self.branch_width = next_width;
             self.branches_in_a = !self.branches_in_a;
@@ -837,21 +950,21 @@ impl BooleanitySequence {
     fn execute_dense(
         &mut self,
         challenge: AkitaField,
-        e_in: &[AkitaField],
-        e_out: &[AkitaField],
+        e_in_length: usize,
+        e_out_length: usize,
+        weight_transitions: [Option<WeightParams>; 2],
     ) -> Result<[AkitaField; MESSAGE_LANES], MetalError> {
         if self.dense_elements < 4 {
             return Err(MetalError::InvalidBooleanityState(
                 "dense transition needs at least four elements",
             ));
         }
-        self.validate_weights(self.dense_elements / 4, e_in, e_out)?;
-        self.write_weights(e_in, e_out)?;
+        self.validate_weights(self.dense_elements / 4, e_in_length, e_out_length)?;
         let params = self.params(
             self.dense_elements,
             self.branch_width,
-            e_in.len(),
-            e_out.len(),
+            e_in_length,
+            e_out_length,
             false,
         )?;
         let challenge = Fp128::from_jolt_field(&challenge);
@@ -860,6 +973,7 @@ impl BooleanitySequence {
         let command_buffer = queue.new_command_buffer();
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
+            self.encode_weight_transitions(encoder, weight_transitions);
             encoder.set_compute_pipeline_state(&self.dense_pipeline);
             encoder.set_buffer(0, Some(self.dense_source_buffer()), 0);
             encoder.set_buffer(1, Some(self.dense_destination_buffer()), 0);
@@ -869,13 +983,17 @@ impl BooleanitySequence {
             encoder.set_buffer(5, Some(&self.buffers.partial_a), 0);
             set_inline_bytes(encoder, 6, &challenge);
             set_inline_bytes(encoder, 7, &params);
-            Self::encode_message_dispatch(encoder, e_out.len(), self.dense_threads_per_threadgroup);
+            Self::encode_message_dispatch(
+                encoder,
+                e_out_length,
+                self.dense_threads_per_threadgroup,
+            );
             let final_in_a = encode_column_reductions(
                 encoder,
                 &self.reduction_pipeline,
                 &self.buffers.partial_a,
                 &self.buffers.partial_b,
-                e_out.len(),
+                e_out_length,
                 MESSAGE_LANES,
                 self.reduction_limits.thread_execution_width,
             )?;
@@ -894,17 +1012,16 @@ impl BooleanitySequence {
     fn validate_weights(
         &self,
         expected: usize,
-        e_in: &[AkitaField],
-        e_out: &[AkitaField],
+        e_in_length: usize,
+        e_out_length: usize,
     ) -> Result<(), MetalError> {
-        let covered = e_in
-            .len()
-            .checked_mul(e_out.len())
+        let covered = e_in_length
+            .checked_mul(e_out_length)
             .ok_or(MetalError::InputTooLong(expected))?;
-        if e_in.is_empty()
-            || e_out.is_empty()
-            || e_in.len() > self.e_in_capacity
-            || e_out.len() > self.e_out_capacity
+        if e_in_length == 0
+            || e_out_length == 0
+            || e_in_length > self.e_in_capacity
+            || e_out_length > self.e_out_capacity
             || covered != expected
         {
             return Err(MetalError::BooleanityWeightShape { expected, covered });
@@ -912,9 +1029,102 @@ impl BooleanitySequence {
         Ok(())
     }
 
-    fn write_weights(&self, e_in: &[AkitaField], e_out: &[AkitaField]) -> Result<(), MetalError> {
-        write_fields(&self.buffers.e_in, self.e_in_capacity, e_in)?;
-        write_fields(&self.buffers.e_out, self.e_out_capacity, e_out)
+    fn write_current_weights(
+        &mut self,
+        e_in: &[AkitaField],
+        e_out: &[AkitaField],
+    ) -> Result<(), MetalError> {
+        write_fields(
+            &self.buffers.e_in,
+            weight_storage_elements(self.e_in_capacity)?,
+            e_in,
+        )?;
+        write_fields(
+            &self.buffers.e_out,
+            weight_storage_elements(self.e_out_capacity)?,
+            e_out,
+        )?;
+        self.e_in_length = e_in.len();
+        self.e_out_length = e_out.len();
+        self.e_in_offset = 0;
+        self.e_out_offset = 0;
+        self.weights_ready = true;
+        Ok(())
+    }
+
+    fn prepare_resident_weights(
+        &mut self,
+        e_in_length: usize,
+        e_out_length: usize,
+    ) -> Result<[Option<WeightParams>; 2], MetalError> {
+        if !self.weights_ready {
+            return Err(MetalError::InvalidBooleanityState(
+                "resident weights require an initialized message",
+            ));
+        }
+        let e_in_transition = next_weight_level(self.e_in_offset, self.e_in_length, e_in_length)?;
+        let e_out_transition =
+            next_weight_level(self.e_out_offset, self.e_out_length, e_out_length)?;
+        if let Some(transition) = e_in_transition {
+            self.e_in_offset = transition.destination_offset as usize;
+        }
+        if let Some(transition) = e_out_transition {
+            self.e_out_offset = transition.destination_offset as usize;
+        }
+        self.e_in_length = e_in_length;
+        self.e_out_length = e_out_length;
+        Ok([e_in_transition, e_out_transition])
+    }
+
+    fn encode_initial_constant(&self, encoder: &metal::ComputeCommandEncoderRef) {
+        if self.initial_constant_ready {
+            return;
+        }
+        let params = BranchParams {
+            polys: self.polys as u32,
+            k: self.k as u32,
+            branch_width: 1,
+            reserved: 0,
+        };
+        encoder.set_compute_pipeline_state(&self.constant_pipeline);
+        encoder.set_buffer(0, Some(&self.buffers.branches_a), 0);
+        encoder.set_buffer(1, Some(&self.buffers.rho), 0);
+        encoder.set_buffer(2, Some(&self.buffers.initial_constant), 0);
+        set_inline_bytes(encoder, 3, &params);
+        self.encode_field_dispatch(encoder, self.polys * (self.k + 1));
+    }
+
+    fn encode_weight_transitions(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        transitions: [Option<WeightParams>; 2],
+    ) {
+        for (buffer, transition) in [&self.buffers.e_in, &self.buffers.e_out]
+            .into_iter()
+            .zip(transitions)
+        {
+            if let Some(params) = transition {
+                encoder.set_compute_pipeline_state(&self.weight_pipeline);
+                encoder.set_buffer(0, Some(buffer), 0);
+                set_inline_bytes(encoder, 1, &params);
+                self.encode_field_dispatch(encoder, params.elements as usize);
+            }
+        }
+    }
+
+    fn encode_field_dispatch(&self, encoder: &metal::ComputeCommandEncoderRef, elements: usize) {
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: elements.div_ceil(self.field_threads_per_threadgroup) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: self.field_threads_per_threadgroup as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 
     fn params(
@@ -939,6 +1149,10 @@ impl BooleanitySequence {
             materialize: u32::from(materialize),
             inc_bias: self.inc_bias,
             chunk_bits: self.chunk_bits as u32,
+            e_in_offset: u32::try_from(self.e_in_offset)
+                .map_err(|_| MetalError::InputTooLong(self.e_in_offset))?,
+            e_out_offset: u32::try_from(self.e_out_offset)
+                .map_err(|_| MetalError::InputTooLong(self.e_out_offset))?,
             reserved: 0,
         })
     }
@@ -1065,43 +1279,38 @@ pub(super) fn write_fields(
     Ok(())
 }
 
-fn write_initial_constant_table(
-    constant_buffer: &Buffer,
-    base_tables: &[AkitaField],
-    rho: &[AkitaField],
-    k: usize,
-) -> Result<(), MetalError> {
-    let expected = rho
-        .len()
-        .checked_mul(k)
-        .ok_or(MetalError::InputTooLong(rho.len()))?;
-    if base_tables.len() != expected {
-        return Err(MetalError::BooleanityStorageLength {
-            name: "initial constant table",
-            expected,
-            got: base_tables.len(),
-        });
+fn weight_storage_elements(root_elements: usize) -> Result<usize, MetalError> {
+    root_elements
+        .checked_mul(2)
+        .and_then(|elements| elements.checked_sub(1))
+        .ok_or(MetalError::InputTooLong(root_elements))
+}
+
+fn next_weight_level(
+    source_offset: usize,
+    current_elements: usize,
+    next_elements: usize,
+) -> Result<Option<WeightParams>, MetalError> {
+    if next_elements == current_elements {
+        return Ok(None);
     }
-    let stride = k + 1;
-    let constant_elements = rho
-        .len()
-        .checked_mul(stride)
-        .ok_or(MetalError::InputTooLong(rho.len()))?;
-    // SAFETY: the fresh shared buffer has the checked capacity below and no
-    // command buffer uses it while the host refreshes a sequence.
-    let constants = unsafe {
-        slice::from_raw_parts_mut(
-            constant_buffer.contents().cast::<Fp128>(),
-            constant_elements,
-        )
-    };
-    for (poly, (table, rho)) in base_tables.chunks_exact(k).zip(rho).enumerate() {
-        for first in 0..stride {
-            let h_0 = table.get(first).copied().unwrap_or_else(AkitaField::zero);
-            constants[poly * stride + first] = Fp128::from_jolt_field(&(h_0 * (h_0 - *rho)));
-        }
+    if next_elements == 0 || next_elements.checked_mul(2) != Some(current_elements) {
+        return Err(MetalError::InvalidBooleanityState(
+            "split-equality levels must shrink by exactly one coordinate",
+        ));
     }
-    Ok(())
+    let destination_offset = source_offset
+        .checked_add(current_elements)
+        .ok_or(MetalError::InputTooLong(source_offset))?;
+    Ok(Some(WeightParams {
+        source_offset: u32::try_from(source_offset)
+            .map_err(|_| MetalError::InputTooLong(source_offset))?,
+        destination_offset: u32::try_from(destination_offset)
+            .map_err(|_| MetalError::InputTooLong(destination_offset))?,
+        elements: u32::try_from(next_elements)
+            .map_err(|_| MetalError::InputTooLong(next_elements))?,
+        reserved: 0,
+    }))
 }
 
 fn byte_length<T>(elements: usize) -> Result<u64, MetalError> {
@@ -1118,8 +1327,12 @@ fn instruction_source_byte_length(rows: usize) -> Result<u64, MetalError> {
 const _: () = assert!(size_of::<BooleanityRow>() == 40);
 const _: () = assert!(BOOLEANITY_SOURCE_ROW_BYTES == 40);
 const _: () = assert!(size_of::<SelectorAbi>() == 8);
-const _: () = assert!(size_of::<Params>() == 48);
+const _: () = assert!(size_of::<Params>() == 56);
 const _: () = assert!(size_of::<BranchParams>() == 16);
+const _: () = assert!(size_of::<WeightParams>() == 16);
+
+#[cfg(test)]
+mod sequence_tests;
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "Metal resident-row validation setup")]

@@ -762,6 +762,37 @@ impl<F: JoltField> OptimizedBooleanityCycleKernel<F> {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 impl OptimizedBooleanityCycleKernel<AkitaField> {
+    pub(crate) fn metal_validate_round(
+        &self,
+        has_bind: bool,
+        round: usize,
+    ) -> Result<(), SumcheckError<AkitaField>> {
+        let expected_bound = if has_bind && round > 0 {
+            round - 1
+        } else if !has_bind && round == 0 {
+            0
+        } else {
+            return Err(booleanity_metal_state_error(
+                "Booleanity bind does not match its round",
+            ));
+        };
+        if round >= self.progress.total() || self.progress.bound() != expected_bound {
+            return Err(booleanity_metal_state_error(
+                "Booleanity rounds arrived out of order",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn metal_validate_final_bind(&self) -> Result<(), SumcheckError<AkitaField>> {
+        if self.progress.bound().checked_add(1) != Some(self.progress.total()) {
+            return Err(booleanity_metal_state_error(
+                "Booleanity final bind arrived out of order",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn metal_row_source(
         &self,
     ) -> Result<&[InstructionCycleRow], SumcheckError<AkitaField>> {
@@ -847,6 +878,11 @@ impl OptimizedBooleanityCycleKernel<AkitaField> {
                 "device bind requires offloaded Booleanity tables",
             ));
         }
+        if self.progress.bound() >= self.progress.total() {
+            return Err(booleanity_metal_state_error(
+                "Booleanity received more binds than cycle variables",
+            ));
+        }
         self.eq.bind(challenge);
         self.progress.advance();
         Ok(())
@@ -863,14 +899,30 @@ impl OptimizedBooleanityCycleKernel<AkitaField> {
         Ok((self.eq.e_in_current(), self.eq.e_out_current()))
     }
 
+    pub(crate) fn metal_next_weight_lengths(
+        &self,
+    ) -> Result<(usize, usize), SumcheckError<AkitaField>> {
+        let (e_in, e_out) = self.metal_weights()?;
+        if self.progress.bound() >= self.progress.total() {
+            return Err(booleanity_metal_state_error(
+                "Booleanity has no remaining split-equality bind",
+            ));
+        }
+        Ok(if e_in.len() > 1 {
+            (e_in.len() / 2, e_out.len())
+        } else {
+            (e_in.len(), (e_out.len() / 2).max(1))
+        })
+    }
+
     pub(crate) fn metal_message(
         &self,
         q_coefficients: [AkitaField; 2],
         previous_claim: AkitaField,
     ) -> Result<UnivariatePoly<AkitaField>, SumcheckError<AkitaField>> {
-        if !self.metal_offloaded {
+        if !self.metal_offloaded || self.progress.bound() >= self.progress.total() {
             return Err(booleanity_metal_state_error(
-                "device message requires offloaded Booleanity tables",
+                "device message requires an active offloaded Booleanity round",
             ));
         }
         Ok(self
@@ -883,10 +935,26 @@ impl OptimizedBooleanityCycleKernel<AkitaField> {
         flat: &[AkitaField],
         elements: usize,
     ) -> Result<(), SumcheckError<AkitaField>> {
-        let expected = self.gamma_powers.len() * elements;
-        if !self.metal_offloaded || elements == 0 || flat.len() != expected {
+        if !self.metal_offloaded
+            || elements == 0
+            || !elements.is_power_of_two()
+            || self.progress.bound() > self.progress.total()
+        {
             return Err(booleanity_metal_state_error(
                 "Booleanity readback shape disagrees with the offloaded state",
+            ));
+        }
+        let expected_elements = 1usize
+            .checked_shl((self.progress.total() - self.progress.bound()) as u32)
+            .ok_or_else(|| booleanity_metal_state_error("Booleanity table length overflow"))?;
+        let expected_values = self
+            .gamma_powers
+            .len()
+            .checked_mul(elements)
+            .ok_or_else(|| booleanity_metal_state_error("Booleanity readback length overflow"))?;
+        if elements != expected_elements || flat.len() != expected_values {
+            return Err(booleanity_metal_state_error(
+                "Booleanity readback shape disagrees with its bound cycle variables",
             ));
         }
         self.tables = LazyFoldedRa::Dense(
