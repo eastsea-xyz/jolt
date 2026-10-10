@@ -1736,6 +1736,10 @@ impl SumcheckKernel<AkitaField> for MetalOuterRemainderKernel {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test module")]
 mod tests {
+    use jolt_claims::protocols::jolt::geometry::dimensions::TraceDimensions;
+    use jolt_claims::protocols::jolt::relations::instruction::{
+        InstructionInputChallenges, InstructionInputInputClaims,
+    };
     use jolt_claims::{NoChallenges, OutputClaims as _};
     use jolt_field::{One as _, Ring as _, Zero as _};
     use jolt_poly::lagrange::centered_lagrange_kernel;
@@ -1760,6 +1764,9 @@ mod tests {
     };
     use crate::metal::{MetalBackend, MetalConfig, SpartanOuterRemainderMetalConfig};
     use crate::optimized::parity::run_lockstep;
+    use crate::ReferenceBackend;
+    use ::metal::BufferRef;
+    use jolt_verifier::stages::stage3::outputs::InstructionInput;
 
     use crate::optimized::spartan_outer::{
         prepare_metal_spartan_outer_witness_rows, OptimizedOuterRemainder, OptimizedOuterUniskip,
@@ -2028,7 +2035,7 @@ mod tests {
         assert_eq!(factored, dense);
     }
 
-    fn adapter_parity_case(log_t: usize, cpu_tail_elements: usize) {
+    fn adapter_parity_case(log_t: usize, cpu_tail_elements: usize, cpu_instruction_handoff: bool) {
         let cycles = 1usize << log_t;
         with_sample_backend_at_log_t(log_t, 4, |witness| {
             let tau = (0..log_t + 2)
@@ -2037,7 +2044,28 @@ mod tests {
             let r0 = AkitaField::from_u64(12_289);
             let relation =
                 OuterRemainder::new(SpartanOuterDimensions::rv64(log_t), tau.clone(), r0);
-            let rows = witness.bundles().unwrap();
+            let rows: Vec<SpartanOuterRow> = witness.bundles().unwrap();
+            let r_product = (0..log_t)
+                .map(|index| AkitaField::from_u64(911 + 17 * index as u64))
+                .collect::<Vec<_>>();
+            let product_eq = EqPolynomial::<AkitaField>::evals(&r_product, None);
+            let instruction_claims: InstructionInputInputClaims<AkitaField> =
+                InstructionInputInputClaims {
+                    left_instruction_input: rows
+                        .iter()
+                        .zip(&product_eq)
+                        .map(|(row, weight)| {
+                            *weight * row.left_instruction_input.to_field::<AkitaField>()
+                        })
+                        .sum(),
+                    right_instruction_input: rows
+                        .iter()
+                        .zip(&product_eq)
+                        .map(|(row, weight)| {
+                            *weight * row.right_instruction_input.to_field::<AkitaField>()
+                        })
+                        .sum(),
+                };
             let input_claim = true_input_claim(&rows, &tau, r0, log_t);
             assert_ne!(input_claim, AkitaField::zero());
             let claims = outer_remainder_input_values_from_uniskip_output(input_claim);
@@ -2083,6 +2111,23 @@ mod tests {
             let metal = MetalBackend::new(config).unwrap();
             let rows =
                 prepare_metal_spartan_outer_witness_rows(&metal.context, witness, cycles).unwrap();
+            let shared_product_source =
+                cpu_instruction_handoff.then(|| rows.share_product_remainder_rows().unwrap());
+            let source_bytes = |buffer: &BufferRef| {
+                // SAFETY: the fixture completely initializes these shared source
+                // buffers, which all subsequent kernels borrow read-only.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.contents().cast::<u8>(),
+                        buffer.length() as usize,
+                    )
+                    .to_vec()
+                }
+            };
+            let original_sources = shared_product_source.as_ref().map(|source| {
+                let (compact, residual) = source.stage1_buffers().unwrap();
+                (source_bytes(compact), source_bytes(residual))
+            });
             let storage = metal
                 .context
                 .prepare_outer_remainder_sequence_storage(
@@ -2148,19 +2193,80 @@ mod tests {
                 .validate_derived_tables(&relation, &points, &output_points, &no_challenges)
                 .unwrap();
             device.park_residue(&mut metal_session);
-            let deferred = metal_session.take::<OuterRemainderSequence>().unwrap();
-            assert_eq!(deferred.phase(), OuterRemainderPhase::OpeningsComplete);
+            assert_eq!(
+                metal_session
+                    .state::<OuterRemainderSequence>()
+                    .unwrap()
+                    .phase(),
+                OuterRemainderPhase::OpeningsComplete
+            );
+            if cpu_instruction_handoff {
+                assert!(cycles < metal.config.instruction_input.trace_cutoff_elements);
+                let input_relation = InstructionInput::new(TraceDimensions::new(log_t), r_product);
+                let input_points = InstructionInputInputClaims {
+                    left_instruction_input: Vec::new(),
+                    right_instruction_input: Vec::new(),
+                };
+                let input_challenges = InstructionInputChallenges {
+                    gamma: AkitaField::from_u64(1_009),
+                };
+                let inputs = || ProverInputs {
+                    relation: &input_relation,
+                    claims: &instruction_claims,
+                    points: &input_points,
+                    challenges: &input_challenges,
+                };
+                let mut reference = PrepareKernel::prepare(
+                    &ReferenceBackend,
+                    &mut ProofSession::default(),
+                    witness,
+                    inputs(),
+                )
+                .unwrap();
+                let mut actual =
+                    PrepareKernel::prepare(&metal, &mut metal_session, witness, inputs()).unwrap();
+                assert!(metal_session.state::<OuterRemainderSequence>().is_none());
+
+                let independent_source = shared_product_source.unwrap();
+                let (compact, residual) = independent_source.stage1_buffers().unwrap();
+                let (original_compact, original_residual) = original_sources.unwrap();
+                assert_eq!(source_bytes(compact), original_compact);
+                assert_eq!(source_bytes(residual), original_residual);
+                let input_claim = instruction_claims.right_instruction_input
+                    + input_challenges.gamma * instruction_claims.left_instruction_input;
+                let challenges = (0..log_t)
+                    .map(|index| AkitaField::from_u64(12_289 + 29 * index as u64))
+                    .collect::<Vec<_>>();
+                run_lockstep(
+                    reference.as_mut(),
+                    actual.as_mut(),
+                    input_claim,
+                    &challenges,
+                );
+                assert_eq!(
+                    reference.output_claims(&instruction_claims).unwrap(),
+                    actual.output_claims(&instruction_claims).unwrap()
+                );
+            } else {
+                let deferred = metal_session.take::<OuterRemainderSequence>().unwrap();
+                assert_eq!(deferred.phase(), OuterRemainderPhase::OpeningsComplete);
+            }
         });
     }
 
     #[test]
     fn outer_remainder_adapter_matches_optimized_cpu_all_rounds_and_openings() {
-        adapter_parity_case(5, 8);
+        adapter_parity_case(5, 8, false);
     }
 
     #[test]
     fn outer_remainder_handoff_waits_for_the_stream_bind() {
-        adapter_parity_case(3, 16);
+        adapter_parity_case(3, 16, false);
+    }
+
+    #[test]
+    fn cpu_instruction_fallback_releases_outer_residue_and_preserves_shared_sources() {
+        adapter_parity_case(4, 4, true);
     }
 
     #[test]

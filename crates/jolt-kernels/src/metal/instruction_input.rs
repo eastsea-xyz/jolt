@@ -332,6 +332,7 @@ impl PrepareKernel<AkitaField, InstructionInput<AkitaField>> for MetalBackend {
         {
             drop(session.take::<PreparedInstructionInput>());
             drop(session.take::<InstructionInputRows>());
+            drop(session.take::<OuterRemainderSequence>());
             return <OptimizedInstructionInput as PrepareKernel<
                 AkitaField,
                 InstructionInput<AkitaField>,
