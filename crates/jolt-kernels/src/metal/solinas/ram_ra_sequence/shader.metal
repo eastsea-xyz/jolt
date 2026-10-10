@@ -1,20 +1,21 @@
-// Direct cycle-order RAM RA virtualization. The fourth reduction lane stays
-// zero so this sequence can share the Instruction RA column reducer.
+// Direct cycle-order RAM RA virtualization for byte and nibble chunks. The
+// factor tables, lazy branches, split-eq weights and dense tail stay resident.
 
-#define RAM_RA_MAX_FACTORS 3u
-#define RAM_RA_BINS 256u
+#define RAM_RA_MAX_FACTORS 8u
+#define RAM_RA_SAMPLES RAM_RA_MAX_FACTORS
 
 struct RamRaMessageParams {
     uint e_in_length;
     uint e_out_length;
     uint factor_count;
-    uint reserved;
+    uint chunk_bits;
 };
 
 struct RamRaBranchParams {
     uint branch_width;
     uint factor_count;
-    uint2 reserved;
+    uint bins;
+    uint reserved;
 };
 
 struct RamRaMaterializeParams {
@@ -22,18 +23,33 @@ struct RamRaMaterializeParams {
     uint e_in_length;
     uint e_out_length;
     uint factor_count;
+    uint chunk_bits;
+    uint reserved_0;
+    uint reserved_1;
+    uint reserved_2;
+};
+
+struct RamRaReductionParams {
+    uint input_count;
+    uint output_count;
+    uint columns;
+    uint reserved;
 };
 
 constant uint ram_ra_branch_width [[function_constant(20)]];
 
-inline uint ram_ra_address_byte(uint address, uint factor, uint factor_count) {
-    return (address >> ((factor_count - 1u - factor) * 8u)) & 0xffu;
+inline uint ram_ra_address_chunk(
+    uint address, uint factor, uint factor_count, uint chunk_bits)
+{
+    return (address >> ((factor_count - 1u - factor) * chunk_bits))
+        & ((1u << chunk_bits) - 1u);
 }
 
 inline bool ram_ra_gather(
     uint pair,
     uint branch_width,
     uint factor_count,
+    uint chunk_bits,
     device const uint* addresses,
     device const SolinasFp128* branches,
     thread InstructionRaLinear* factors)
@@ -53,19 +69,21 @@ inline bool ram_ra_gather(
         if (lo_address != 0xffffffffu) {
             active = true;
             for (uint factor = 0; factor < factor_count; factor++) {
-                uint table = (factor * branch_width + offset) * RAM_RA_BINS;
+                uint table = (factor * branch_width + offset) * (1u << chunk_bits);
                 lo[factor] = solinas_add(
                     lo[factor],
-                    branches[table + ram_ra_address_byte(lo_address, factor, factor_count)]);
+                    branches[table + ram_ra_address_chunk(
+                        lo_address, factor, factor_count, chunk_bits)]);
             }
         }
         if (hi_address != 0xffffffffu) {
             active = true;
             for (uint factor = 0; factor < factor_count; factor++) {
-                uint table = (factor * branch_width + offset) * RAM_RA_BINS;
+                uint table = (factor * branch_width + offset) * (1u << chunk_bits);
                 hi[factor] = solinas_add(
                     hi[factor],
-                    branches[table + ram_ra_address_byte(hi_address, factor, factor_count)]);
+                    branches[table + ram_ra_address_chunk(
+                        hi_address, factor, factor_count, chunk_bits)]);
             }
         }
     }
@@ -82,20 +100,79 @@ inline void ram_ra_product(
     uint factor_count,
     thread SolinasFp128* q)
 {
-    if (factor_count == 2u) {
-        q[0] = solinas_mul_wide(factors[0].at_one, factors[1].at_one);
-        q[1] = solinas_mul_wide(factors[0].at_infinity, factors[1].at_infinity);
-        q[2] = solinas_zero();
-        q[3] = solinas_zero();
-        return;
+    for (uint sample = 0; sample < RAM_RA_SAMPLES; sample++) {
+        q[sample] = solinas_zero();
     }
-    InstructionRaQuadratic first = instruction_ra_quadratic(factors[0], factors[1]);
-    q[0] = solinas_mul_wide(first.at_one, factors[2].at_one);
-    q[1] = solinas_mul_wide(
-        first.at_two,
-        solinas_add(factors[2].at_one, factors[2].at_infinity));
-    q[2] = solinas_mul_wide(first.at_infinity, factors[2].at_infinity);
-    q[3] = solinas_zero();
+
+    // Pair linear factors first. A quadratic's finite differences let us
+    // advance through 1..factor_count-1 using additions, rather than multiply
+    // all factors independently at every sample. The last sample is infinity.
+    uint pairs = factor_count / 2u;
+    SolinasFp128 values[RAM_RA_MAX_FACTORS / 2u];
+    SolinasFp128 steps[RAM_RA_MAX_FACTORS / 2u];
+    SolinasFp128 curvature[RAM_RA_MAX_FACTORS / 2u];
+    SolinasFp128 leading = solinas_zero();
+    leading.limb[0] = 1u;
+    for (uint pair = 0; pair < pairs; pair++) {
+        InstructionRaQuadratic quadratic = instruction_ra_quadratic(
+            factors[2u * pair], factors[2u * pair + 1u]);
+        values[pair] = quadratic.at_one;
+        steps[pair] = solinas_sub(quadratic.at_two, quadratic.at_one);
+        curvature[pair] = solinas_add(quadratic.at_infinity, quadratic.at_infinity);
+        leading = solinas_mul_wide(leading, quadratic.at_infinity);
+    }
+    bool odd = (factor_count & 1u) != 0u;
+    SolinasFp128 odd_value = factors[factor_count - 1u].at_one;
+    if (odd) {
+        leading = solinas_mul_wide(leading, factors[factor_count - 1u].at_infinity);
+    }
+    for (uint sample = 0; sample + 1u < factor_count; sample++) {
+        SolinasFp128 product = values[0];
+        for (uint pair = 1; pair < pairs; pair++) {
+            product = solinas_mul_wide(product, values[pair]);
+        }
+        if (odd) {
+            product = solinas_mul_wide(product, odd_value);
+            odd_value = solinas_add(odd_value, factors[factor_count - 1u].at_infinity);
+        }
+        q[sample] = product;
+        for (uint pair = 0; pair < pairs; pair++) {
+            values[pair] = solinas_add(values[pair], steps[pair]);
+            steps[pair] = solinas_add(steps[pair], curvature[pair]);
+        }
+    }
+    q[factor_count - 1u] = leading;
+}
+
+inline void ram_ra_finish_block(
+    thread SolinasFp128* lanes,
+    SolinasFp128 e_out,
+    device SolinasFp128* partials,
+    threadgroup SolinasFp128* shared,
+    uint x_out,
+    uint e_out_length,
+    uint lane_in_simd,
+    uint simdgroup,
+    uint simdgroups)
+{
+    for (uint sample = 0; sample < RAM_RA_SAMPLES; sample++) {
+        SolinasFp128 sum = solinas_simd_sum_32(lanes[sample]);
+        if (lane_in_simd == 0) {
+            shared[sample * simdgroups + simdgroup] = sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        for (uint sample = 0; sample < RAM_RA_SAMPLES; sample++) {
+            SolinasFp128 sum = lane_in_simd < simdgroups
+                ? shared[sample * simdgroups + lane_in_simd]
+                : solinas_zero();
+            sum = solinas_simd_sum_32(sum);
+            if (lane_in_simd == 0) {
+                partials[sample * e_out_length + x_out] = solinas_mul_wide(e_out, sum);
+            }
+        }
+    }
 }
 
 kernel void solinas_ram_ra_lazy_message(
@@ -112,8 +189,8 @@ kernel void solinas_ram_ra_lazy_message(
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]])
 {
-    SolinasFp128 lanes[INSTRUCTION_RA_SAMPLES];
-    for (uint sample = 0; sample < INSTRUCTION_RA_SAMPLES; sample++) {
+    SolinasFp128 lanes[RAM_RA_SAMPLES];
+    for (uint sample = 0; sample < RAM_RA_SAMPLES; sample++) {
         lanes[sample] = solinas_zero();
     }
 
@@ -124,12 +201,13 @@ kernel void solinas_ram_ra_lazy_message(
                 pair,
                 ram_ra_branch_width,
                 params.factor_count,
+                params.chunk_bits,
                 addresses,
                 branches,
                 factors)) {
             continue;
         }
-        SolinasFp128 q[INSTRUCTION_RA_SAMPLES];
+        SolinasFp128 q[RAM_RA_SAMPLES];
         ram_ra_product(factors, params.factor_count, q);
         for (uint sample = 0; sample < params.factor_count; sample++) {
             lanes[sample] = solinas_add(
@@ -138,7 +216,7 @@ kernel void solinas_ram_ra_lazy_message(
         }
     }
 
-    instruction_ra_finish_block(
+    ram_ra_finish_block(
         lanes,
         e_out[x_out],
         partials,
@@ -157,7 +235,7 @@ kernel void solinas_ram_ra_double_branches(
     constant RamRaBranchParams& params [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint per_factor = params.branch_width * RAM_RA_BINS;
+    uint per_factor = params.branch_width * params.bins;
     uint elements = params.factor_count * per_factor;
     if (gid >= elements) {
         return;
@@ -189,8 +267,8 @@ kernel void solinas_ram_ra_materialize_width_16(
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]])
 {
-    SolinasFp128 lanes[INSTRUCTION_RA_SAMPLES];
-    for (uint sample = 0; sample < INSTRUCTION_RA_SAMPLES; sample++) {
+    SolinasFp128 lanes[RAM_RA_SAMPLES];
+    for (uint sample = 0; sample < RAM_RA_SAMPLES; sample++) {
         lanes[sample] = solinas_zero();
     }
 
@@ -198,7 +276,7 @@ kernel void solinas_ram_ra_materialize_width_16(
         uint pair = x_out * params.e_in_length + x_in;
         InstructionRaLinear factors[RAM_RA_MAX_FACTORS];
         bool active = ram_ra_gather(
-            pair, 16u, params.factor_count, addresses, branches, factors);
+            pair, 16u, params.factor_count, params.chunk_bits, addresses, branches, factors);
         for (uint factor = 0; factor < params.factor_count; factor++) {
             uint destination = factor * params.source_elements + 2u * pair;
             dense[destination] = solinas_sub(
@@ -209,7 +287,7 @@ kernel void solinas_ram_ra_materialize_width_16(
         if (!active) {
             continue;
         }
-        SolinasFp128 q[INSTRUCTION_RA_SAMPLES];
+        SolinasFp128 q[RAM_RA_SAMPLES];
         ram_ra_product(factors, params.factor_count, q);
         for (uint sample = 0; sample < params.factor_count; sample++) {
             lanes[sample] = solinas_add(
@@ -218,7 +296,7 @@ kernel void solinas_ram_ra_materialize_width_16(
         }
     }
 
-    instruction_ra_finish_block(
+    ram_ra_finish_block(
         lanes,
         e_out[x_out],
         partials,
@@ -245,8 +323,8 @@ kernel void solinas_ram_ra_dense_transition(
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]])
 {
-    SolinasFp128 lanes[INSTRUCTION_RA_SAMPLES];
-    for (uint sample = 0; sample < INSTRUCTION_RA_SAMPLES; sample++) {
+    SolinasFp128 lanes[RAM_RA_SAMPLES];
+    for (uint sample = 0; sample < RAM_RA_SAMPLES; sample++) {
         lanes[sample] = solinas_zero();
     }
     uint bound_elements = params.source_elements / 2u;
@@ -272,7 +350,7 @@ kernel void solinas_ram_ra_dense_transition(
             factors[factor].at_one = bound_1;
             factors[factor].at_infinity = solinas_sub(bound_1, bound_0);
         }
-        SolinasFp128 q[INSTRUCTION_RA_SAMPLES];
+        SolinasFp128 q[RAM_RA_SAMPLES];
         ram_ra_product(factors, params.factor_count, q);
         for (uint sample = 0; sample < params.factor_count; sample++) {
             lanes[sample] = solinas_add(
@@ -281,7 +359,7 @@ kernel void solinas_ram_ra_dense_transition(
         }
     }
 
-    instruction_ra_finish_block(
+    ram_ra_finish_block(
         lanes,
         e_out[x_out],
         partials,
@@ -291,4 +369,54 @@ kernel void solinas_ram_ra_dense_transition(
         lane_in_simd,
         simdgroup,
         threads / 32u);
+}
+
+kernel void solinas_ram_ra_contract_eq(
+    device const SolinasFp128* source [[buffer(0)]],
+    device SolinasFp128* destination [[buffer(1)]],
+    constant uint& elements [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < elements) {
+        destination[gid] = solinas_add(source[2u * gid], source[2u * gid + 1u]);
+    }
+}
+
+kernel void solinas_ram_ra_terminal_bind(
+    device const SolinasFp128* tables [[buffer(0)]],
+    device SolinasFp128* terminal [[buffer(1)]],
+    constant SolinasFp128& challenge [[buffer(2)]],
+    constant uint& factor_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= RAM_RA_MAX_FACTORS) {
+        return;
+    }
+    if (gid >= factor_count) {
+        terminal[gid] = solinas_zero();
+        return;
+    }
+    SolinasFp128 lo = tables[2u * gid];
+    SolinasFp128 hi = tables[2u * gid + 1u];
+    terminal[gid] = solinas_add(
+        lo,
+        solinas_mul_wide(challenge, solinas_sub(hi, lo)));
+}
+
+kernel void solinas_ram_ra_reduce(
+    device const SolinasFp128* input [[buffer(0)]],
+    device SolinasFp128* output [[buffer(1)]],
+    constant RamRaReductionParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint lane_in_simd [[thread_index_in_simdgroup]])
+{
+    for (uint sample = 0; sample < params.columns; sample++) {
+        SolinasFp128 value = gid < params.input_count
+            ? input[sample * params.input_count + gid]
+            : solinas_zero();
+        value = solinas_simd_sum_32(value);
+        if (lane_in_simd == 0) {
+            output[sample * params.output_count + gid / 32u] = value;
+        }
+    }
 }
