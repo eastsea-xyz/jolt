@@ -11,6 +11,8 @@ struct BooleanityParams {
     uint materialize;
     ulong inc_bias;
     uint chunk_bits;
+    uint e_in_offset;
+    uint e_out_offset;
     uint reserved;
 };
 
@@ -26,6 +28,61 @@ struct BooleanityReductionParams {
     uint output_count;
     uint2 reserved;
 };
+
+struct BooleanityWeightParams {
+    uint source_offset;
+    uint destination_offset;
+    uint elements;
+    uint reserved;
+};
+
+kernel void solinas_booleanity_initial_constant(
+    device const SolinasFp128* base [[buffer(0)]],
+    device const SolinasFp128* rho [[buffer(1)]],
+    device SolinasFp128* constant_table [[buffer(2)]],
+    constant BooleanityBranchParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint stride = params.k + 1u;
+    if (gid >= params.polys * stride) {
+        return;
+    }
+    uint poly = gid / stride;
+    uint hot = gid % stride;
+    SolinasFp128 h_0 = hot < params.k
+        ? base[poly * params.k + hot]
+        : solinas_zero();
+    constant_table[gid] = solinas_mul_wide(h_0, solinas_sub(h_0, rho[poly]));
+}
+
+// Removing the last reference coordinate sums adjacent equality weights.
+// Store each smaller level after its source, so every dispatch reads and
+// writes disjoint ranges of the same resident allocation.
+kernel void solinas_booleanity_shrink_weights(
+    device SolinasFp128* weights [[buffer(0)]],
+    constant BooleanityWeightParams& params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.elements) {
+        return;
+    }
+    uint source = params.source_offset + 2u * gid;
+    weights[params.destination_offset + gid] = solinas_add(weights[source], weights[source + 1u]);
+}
+
+kernel void solinas_booleanity_finish_bind(
+    device const SolinasFp128* source [[buffer(0)]],
+    device SolinasFp128* terminal [[buffer(1)]],
+    constant SolinasFp128& challenge [[buffer(2)]],
+    constant BooleanityBranchParams& params [[buffer(3)]],
+    uint poly [[thread_position_in_grid]])
+{
+    if (poly >= params.polys) {
+        return;
+    }
+    SolinasFp128 lo = source[2u * poly];
+    terminal[poly] = solinas_add(lo, solinas_mul_wide(challenge, solinas_sub(source[2u * poly + 1u], lo)));
+}
 
 inline ulong booleanity_broadcast_ulong(ulong value, ushort source_lane)
 {
@@ -72,13 +129,26 @@ inline void booleanity_lazy_pair(
     thread SolinasFp128& constant_lane,
     thread SolinasFp128& leading_lane)
 {
-    for (uint poly = lane; poly < params.polys; poly += 32u) {
+    // Every lane participates in row broadcasts, including unused lanes
+    // in the final polynomial group. Its five source lanes must remain
+    // active even when fewer than five polynomials remain.
+    for (uint poly_base = 0u; poly_base < params.polys; poly_base += 32u) {
+        uint poly = poly_base + lane;
+        bool active = poly < params.polys;
+        BooleanitySelector selector;
+        selector.kind = 0u;
+        selector.shift = 0u;
+        if (active) {
+            selector = selectors[poly];
+        }
         if (params.branch_width == 1u && params.materialize == 0u) {
-            BooleanitySelector selector = selectors[poly];
             BooleanityRow row_0 = booleanity_load_row_simd(
                 rows, params.rows, 2u * pair, lane);
             BooleanityRow row_1 = booleanity_load_row_simd(
                 rows, params.rows, 2u * pair + 1u, lane);
+            if (!active) {
+                continue;
+            }
             uint first = params.k;
             uint second = params.k;
             booleanity_hot_index(
@@ -104,7 +174,6 @@ inline void booleanity_lazy_pair(
         }
         SolinasFp128 h_0 = solinas_zero();
         SolinasFp128 h_1 = solinas_zero();
-        BooleanitySelector selector = selectors[poly];
         uint original = 2u * pair * params.branch_width;
         for (uint offset = 0; offset < params.branch_width; offset++) {
             BooleanityRow row_0 = booleanity_load_row_simd(
@@ -114,6 +183,9 @@ inline void booleanity_lazy_pair(
                 params.rows,
                 original + params.branch_width + offset,
                 lane);
+            if (!active) {
+                continue;
+            }
             uint hot;
             uint table = (poly * params.branch_width + offset) * params.k;
             if (booleanity_hot_index(
@@ -124,6 +196,9 @@ inline void booleanity_lazy_pair(
                     row_1, selector, params.chunk_bits, params.inc_bias, hot)) {
                 h_1 = solinas_add(h_1, branches[table + hot]);
             }
+        }
+        if (!active) {
+            continue;
         }
         if (params.materialize != 0u) {
             uint destination = poly * params.source_elements + 2u * pair;
@@ -213,16 +288,16 @@ kernel void solinas_booleanity_lazy_message(
         if (lane == 0u) {
             constant_sum = solinas_add(
                 constant_sum,
-                solinas_mul_wide(e_in[x_in], constant_lane));
+                solinas_mul_wide(e_in[params.e_in_offset + x_in], constant_lane));
             leading_sum = solinas_add(
                 leading_sum,
-                solinas_mul_wide(e_in[x_in], leading_lane));
+                solinas_mul_wide(e_in[params.e_in_offset + x_in], leading_lane));
         }
     }
     booleanity_finish_block(
         constant_sum,
         leading_sum,
-        e_out[x_out],
+        e_out[params.e_out_offset + x_out],
         partials,
         shared,
         x_out,
@@ -306,16 +381,16 @@ kernel void solinas_booleanity_dense_transition(
         if (lane == 0u) {
             constant_sum = solinas_add(
                 constant_sum,
-                solinas_mul_wide(e_in[x_in], constant_lane));
+                solinas_mul_wide(e_in[params.e_in_offset + x_in], constant_lane));
             leading_sum = solinas_add(
                 leading_sum,
-                solinas_mul_wide(e_in[x_in], leading_lane));
+                solinas_mul_wide(e_in[params.e_in_offset + x_in], leading_lane));
         }
     }
     booleanity_finish_block(
         constant_sum,
         leading_sum,
-        e_out[x_out],
+        e_out[params.e_out_offset + x_out],
         partials,
         shared,
         x_out,

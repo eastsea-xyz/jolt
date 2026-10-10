@@ -98,6 +98,7 @@ pub use bytecode_cycle::{
     BytecodeCycleSequence, BytecodeCycleSequenceConfig, BytecodeCycleTables,
     BytecodeCycleTablesMut, BYTECODE_CYCLE_SAMPLES, BYTECODE_CYCLE_TABLES,
 };
+pub(crate) use bytecode_cycle::{BytecodeCycleWideInputs, BytecodeCycleWideSequence};
 pub(crate) use bytecode_row::{BytecodeCycleRowInputs, BytecodeCycleRowSequence};
 pub(crate) use instruction_claim_reduction_successor::{
     PendingProductInstructionInitialMessage, ProductInstructionOpenings,

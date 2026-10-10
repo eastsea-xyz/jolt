@@ -1,7 +1,6 @@
 use std::{ffi::c_void, mem::size_of, slice, sync::Arc};
 
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
-use jolt_field::Zero as _;
 use metal::{
     objc::rc::autoreleasepool, Buffer, ComputePipelineState, FunctionConstantValues, MTLDataType,
     MTLResourceOptions, MTLSize,
@@ -13,10 +12,9 @@ use super::{
 };
 use crate::metal::ram_records::RamAccessColumns;
 
-const MAX_FACTORS: usize = 3;
-const BINS: usize = 256;
-const REDUCTION_COLUMNS: usize = 4;
-const MESSAGE_SAMPLES: usize = 3;
+const MAX_FACTORS: usize = 8;
+const REDUCTION_COLUMNS: usize = MAX_FACTORS;
+const MESSAGE_SAMPLES: usize = MAX_FACTORS;
 const SIMD_WIDTH: usize = 32;
 const MESSAGE_THREADS: usize = 128;
 const MATERIALIZE_THREADS: usize = 64;
@@ -27,7 +25,9 @@ const LAZY_PIPELINE: &str = "solinas_ram_ra_lazy_message";
 const DOUBLE_PIPELINE: &str = "solinas_ram_ra_double_branches";
 const MATERIALIZE_PIPELINE: &str = "solinas_ram_ra_materialize_width_16";
 const DENSE_PIPELINE: &str = "solinas_ram_ra_dense_transition";
-const REDUCE_PIPELINE: &str = "solinas_instruction_ra_reduce";
+const REDUCE_PIPELINE: &str = "solinas_ram_ra_reduce";
+const CONTRACT_EQ_PIPELINE: &str = "solinas_ram_ra_contract_eq";
+const TERMINAL_PIPELINE: &str = "solinas_ram_ra_terminal_bind";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -35,7 +35,7 @@ struct MessageParams {
     e_in_length: u32,
     e_out_length: u32,
     factor_count: u32,
-    _reserved: u32,
+    chunk_bits: u32,
 }
 
 #[repr(C)]
@@ -43,7 +43,8 @@ struct MessageParams {
 struct BranchParams {
     branch_width: u32,
     factor_count: u32,
-    _reserved: [u32; 2],
+    bins: u32,
+    _reserved: u32,
 }
 
 #[repr(C)]
@@ -53,6 +54,8 @@ struct MaterializeParams {
     e_in_length: u32,
     e_out_length: u32,
     factor_count: u32,
+    chunk_bits: u32,
+    _reserved: [u32; 3],
 }
 
 struct Pipelines {
@@ -61,6 +64,8 @@ struct Pipelines {
     materialize: ComputePipelineState,
     dense: ComputePipelineState,
     reduce: ComputePipelineState,
+    contract_eq: ComputePipelineState,
+    terminal: ComputePipelineState,
 }
 
 struct Buffers {
@@ -71,6 +76,8 @@ struct Buffers {
     dense_b: Buffer,
     e_in: Buffer,
     e_out: Buffer,
+    e_in_b: Buffer,
+    e_out_b: Buffer,
     partial_a: Buffer,
     partial_b: Buffer,
 }
@@ -83,8 +90,15 @@ pub(crate) struct RamRaSequence {
     buffers: Buffers,
     rows: usize,
     factors: usize,
+    bins: usize,
+    chunk_bits: usize,
     e_in_capacity: usize,
     e_out_capacity: usize,
+    weights_initialized: bool,
+    e_in_elements: usize,
+    e_out_elements: usize,
+    e_in_in_a: bool,
+    e_out_in_a: bool,
     message_threads: usize,
     materialize_threads: usize,
     branch_threads: usize,
@@ -163,15 +177,21 @@ impl SolinasMetal {
         }
         if !(2..=MAX_FACTORS).contains(&factors) {
             return Err(MetalError::InvalidRamRaState(
-                "the direct sequence supports two or three factors",
+                "the direct sequence supports two through eight factors",
             ));
         }
-        if chunk_tables.len() != factors * BINS {
-            return Err(MetalError::RamRaStorageLength {
-                expected: factors * BINS,
-                got: chunk_tables.len(),
-            });
+        // Infer the chunk width to keep the original byte-sequence API. All
+        // committed chunks include their leading zero-coordinate padding.
+        let bins = chunk_tables.len() / factors;
+        if ![16, 256].contains(&bins)
+            || chunk_tables.len() != factors * bins
+            || (bins == 256 && factors > 3)
+        {
+            return Err(MetalError::InvalidRamRaState(
+                "RAM RA requires two through eight nibble factors or two/three byte factors",
+            ));
         }
+        let chunk_bits = bins.trailing_zeros() as usize;
         let covered = e_in_capacity
             .checked_mul(e_out_capacity)
             .ok_or(MetalError::InputTooLong(rows))?;
@@ -195,6 +215,8 @@ impl SolinasMetal {
             materialize: self.compile_named_pipeline(MATERIALIZE_PIPELINE)?,
             dense: self.compile_named_pipeline(DENSE_PIPELINE)?,
             reduce: self.compile_named_pipeline(REDUCE_PIPELINE)?,
+            contract_eq: self.compile_named_pipeline(CONTRACT_EQ_PIPELINE)?,
+            terminal: self.compile_named_pipeline(TERMINAL_PIPELINE)?,
         };
         let message_limits = Self::limits(&pipelines.lazy[0].1);
         let materialize_limits = Self::limits(&pipelines.materialize);
@@ -205,6 +227,8 @@ impl SolinasMetal {
             (MATERIALIZE_PIPELINE, materialize_limits),
             (DENSE_PIPELINE, Self::limits(&pipelines.dense)),
             (REDUCE_PIPELINE, reduction_limits),
+            (CONTRACT_EQ_PIPELINE, Self::limits(&pipelines.contract_eq)),
+            (TERMINAL_PIPELINE, Self::limits(&pipelines.terminal)),
         ] {
             if limits.thread_execution_width != SIMD_WIDTH {
                 return Err(MetalError::UnsupportedRamRaExecutionWidth {
@@ -231,7 +255,7 @@ impl SolinasMetal {
         let branch_threads =
             Self::resolve_threadgroup_width(Some(BRANCH_THREADS), Self::limits(&pipelines.double))?;
 
-        let branch_capacity = factors * MATERIALIZE_WIDTH * BINS;
+        let branch_capacity = factors * MATERIALIZE_WIDTH * bins;
         let dense_a_capacity = factors
             .checked_mul(rows / MATERIALIZE_WIDTH)
             .ok_or(MetalError::InputTooLong(rows))?;
@@ -247,6 +271,8 @@ impl SolinasMetal {
             byte_length::<Fp128>(dense_b_capacity)?,
             byte_length::<Fp128>(e_in_capacity)?,
             byte_length::<Fp128>(e_out_capacity)?,
+            byte_length::<Fp128>(e_in_capacity)?,
+            byte_length::<Fp128>(e_out_capacity)?,
             byte_length::<Fp128>(partial_capacity)?,
             byte_length::<Fp128>(partial_capacity)?,
         ]
@@ -260,11 +286,15 @@ impl SolinasMetal {
                 .ok_or(MetalError::InputTooLong(rows))?,
         )?;
 
-        let (addresses, _) = self.shared_no_copy_buffer(
-            Arc::clone(&columns),
+        // This is the last RAM-address consumer. The sequence owns the source
+        // Arc until all of its synchronous commands finish, so the alias does
+        // not need the backend cache's longer-lived source-owner entry.
+        let addresses = self.device.new_buffer_with_bytes_no_copy(
             columns.addresses.as_ptr().cast_mut().cast::<c_void>(),
             source_bytes,
-        )?;
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
         let buffers = Buffers {
             addresses,
             branches_a: new_field_buffer(self, branch_capacity)?,
@@ -273,6 +303,8 @@ impl SolinasMetal {
             dense_b: new_field_buffer(self, dense_b_capacity)?,
             e_in: new_field_buffer(self, e_in_capacity)?,
             e_out: new_field_buffer(self, e_out_capacity)?,
+            e_in_b: new_field_buffer(self, e_in_capacity)?,
+            e_out_b: new_field_buffer(self, e_out_capacity)?,
             partial_a: new_field_buffer(self, partial_capacity)?,
             partial_b: new_field_buffer(self, partial_capacity)?,
         };
@@ -286,8 +318,15 @@ impl SolinasMetal {
             buffers,
             rows,
             factors,
+            bins,
+            chunk_bits,
             e_in_capacity,
             e_out_capacity,
+            weights_initialized: false,
+            e_in_elements: e_in_capacity,
+            e_out_elements: e_out_capacity,
+            e_in_in_a: true,
+            e_out_in_a: true,
             message_threads,
             materialize_threads,
             branch_threads,
@@ -331,22 +370,35 @@ impl RamRaSequence {
                 "terminal bind requires two dense values per factor",
             ));
         }
-        // SAFETY: the last dense command completed synchronously and the active
-        // source contains exactly two initialized fields per factor.
-        let values = unsafe {
-            slice::from_raw_parts(
-                self.dense_source_buffer().contents().cast::<Fp128>(),
-                self.factors * 2,
-            )
-        };
-        self.context
-            .validate_inputs("RAM RA terminal tables", values)?;
-        let mut output = [AkitaField::zero(); MAX_FACTORS];
-        for (factor, output) in output.iter_mut().enumerate().take(self.factors) {
-            let lo = values[2 * factor].into_jolt_field::<AkitaField>();
-            let hi = values[2 * factor + 1].into_jolt_field::<AkitaField>();
-            *output = lo + challenge * (hi - lo);
-        }
+        // Reuse the completed message scratch for the terminal claims. The
+        // dense factor pairs stay resident; only the eight bound values are
+        // read after the dedicated terminal command completes.
+        let output = autoreleasepool(|| {
+            let command_buffer = self.context.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipelines.terminal);
+            encoder.set_buffer(0, Some(self.dense_source_buffer()), 0);
+            encoder.set_buffer(1, Some(&self.buffers.partial_a), 0);
+            set_inline_bytes(encoder, 2, &Fp128::from_jolt_field(&challenge));
+            set_inline_bytes(encoder, 3, &(self.factors as u32));
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: SIMD_WIDTH as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            crate::metal::profiling::record_submission(command_buffer);
+            command_buffer.wait_until_completed();
+            self.finish_command(command_buffer, true)
+        })?;
         self.dense_elements = 1;
         Ok(output)
     }
@@ -391,6 +443,8 @@ impl RamRaSequence {
         let source_elements = self.rows / next_width;
         self.validate_weights(source_elements / 2, e_in, e_out)?;
         self.write_weights(e_in, e_out)?;
+        let weight_in_a = self.e_in_in_a ^ (e_in.len() != self.e_in_elements);
+        let weight_out_a = self.e_out_in_a ^ (e_out.len() != self.e_out_elements);
         let materialize = next_width == MATERIALIZE_WIDTH;
         let message_params = MessageParams {
             e_in_length: u32::try_from(e_in.len())
@@ -398,7 +452,7 @@ impl RamRaSequence {
             e_out_length: u32::try_from(e_out.len())
                 .map_err(|_| MetalError::InputTooLong(e_out.len()))?,
             factor_count: self.factors as u32,
-            _reserved: 0,
+            chunk_bits: self.chunk_bits as u32,
         };
         let materialize_params = MaterializeParams {
             source_elements: u32::try_from(source_elements)
@@ -406,6 +460,8 @@ impl RamRaSequence {
             e_in_length: message_params.e_in_length,
             e_out_length: message_params.e_out_length,
             factor_count: self.factors as u32,
+            chunk_bits: self.chunk_bits as u32,
+            _reserved: [0; 3],
         };
         let message_pipeline = if materialize {
             None
@@ -417,19 +473,21 @@ impl RamRaSequence {
         let command_buffer = queue.new_command_buffer();
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
+            self.encode_weight_contraction(encoder, e_in.len(), e_out.len());
             let mut message_branches_in_a = self.branches_in_a;
             if let Some(challenge) = challenge {
                 let params = BranchParams {
                     branch_width: self.branch_width as u32,
                     factor_count: self.factors as u32,
-                    _reserved: [0; 2],
+                    bins: self.bins as u32,
+                    _reserved: 0,
                 };
                 encoder.set_compute_pipeline_state(&self.pipelines.double);
                 encoder.set_buffer(0, Some(self.branch_source_buffer()), 0);
                 encoder.set_buffer(1, Some(self.branch_destination_buffer()), 0);
                 set_inline_bytes(encoder, 2, &Fp128::from_jolt_field(&challenge));
                 set_inline_bytes(encoder, 3, &params);
-                let elements = self.factors * self.branch_width * BINS;
+                let elements = self.factors * self.branch_width * self.bins;
                 encoder.dispatch_thread_groups(
                     MTLSize {
                         width: elements.div_ceil(self.branch_threads) as u64,
@@ -450,8 +508,8 @@ impl RamRaSequence {
                 encoder.set_buffer(0, Some(&self.buffers.addresses), 0);
                 encoder.set_buffer(1, Some(self.branch_buffer(message_branches_in_a)), 0);
                 encoder.set_buffer(2, Some(&self.buffers.dense_a), 0);
-                encoder.set_buffer(3, Some(&self.buffers.e_in), 0);
-                encoder.set_buffer(4, Some(&self.buffers.e_out), 0);
+                encoder.set_buffer(3, Some(self.e_in_buffer(weight_in_a)), 0);
+                encoder.set_buffer(4, Some(self.e_out_buffer(weight_out_a)), 0);
                 encoder.set_buffer(5, Some(&self.buffers.partial_a), 0);
                 set_inline_bytes(encoder, 6, &materialize_params);
                 Self::encode_message_dispatch(encoder, e_out.len(), self.materialize_threads);
@@ -461,8 +519,8 @@ impl RamRaSequence {
                 )?);
                 encoder.set_buffer(0, Some(&self.buffers.addresses), 0);
                 encoder.set_buffer(1, Some(self.branch_buffer(message_branches_in_a)), 0);
-                encoder.set_buffer(2, Some(&self.buffers.e_in), 0);
-                encoder.set_buffer(3, Some(&self.buffers.e_out), 0);
+                encoder.set_buffer(2, Some(self.e_in_buffer(weight_in_a)), 0);
+                encoder.set_buffer(3, Some(self.e_out_buffer(weight_out_a)), 0);
                 encoder.set_buffer(4, Some(&self.buffers.partial_a), 0);
                 set_inline_bytes(encoder, 5, &message_params);
                 Self::encode_message_dispatch(encoder, e_out.len(), self.message_threads);
@@ -484,6 +542,7 @@ impl RamRaSequence {
         })?;
 
         let message = self.finish_command(command_buffer, final_in_a)?;
+        self.advance_weights(e_in.len(), e_out.len(), weight_in_a, weight_out_a);
         if challenge.is_some() {
             self.branch_width = next_width;
             self.branches_in_a = !self.branches_in_a;
@@ -509,6 +568,8 @@ impl RamRaSequence {
         }
         self.validate_weights(self.dense_elements / 4, e_in, e_out)?;
         self.write_weights(e_in, e_out)?;
+        let weight_in_a = self.e_in_in_a ^ (e_in.len() != self.e_in_elements);
+        let weight_out_a = self.e_out_in_a ^ (e_out.len() != self.e_out_elements);
         let params = MaterializeParams {
             source_elements: u32::try_from(self.dense_elements)
                 .map_err(|_| MetalError::InputTooLong(self.dense_elements))?,
@@ -517,17 +578,20 @@ impl RamRaSequence {
             e_out_length: u32::try_from(e_out.len())
                 .map_err(|_| MetalError::InputTooLong(e_out.len()))?,
             factor_count: self.factors as u32,
+            chunk_bits: self.chunk_bits as u32,
+            _reserved: [0; 3],
         };
 
         let queue = self.context.queue.clone();
         let command_buffer = queue.new_command_buffer();
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
+            self.encode_weight_contraction(encoder, e_in.len(), e_out.len());
             encoder.set_compute_pipeline_state(&self.pipelines.dense);
             encoder.set_buffer(0, Some(self.dense_source_buffer()), 0);
             encoder.set_buffer(1, Some(self.dense_destination_buffer()), 0);
-            encoder.set_buffer(2, Some(&self.buffers.e_in), 0);
-            encoder.set_buffer(3, Some(&self.buffers.e_out), 0);
+            encoder.set_buffer(2, Some(self.e_in_buffer(weight_in_a)), 0);
+            encoder.set_buffer(3, Some(self.e_out_buffer(weight_out_a)), 0);
             encoder.set_buffer(4, Some(&self.buffers.partial_a), 0);
             set_inline_bytes(encoder, 5, &Fp128::from_jolt_field(&challenge));
             set_inline_bytes(encoder, 6, &params);
@@ -549,6 +613,7 @@ impl RamRaSequence {
         })?;
 
         let message = self.finish_command(command_buffer, final_in_a)?;
+        self.advance_weights(e_in.len(), e_out.len(), weight_in_a, weight_out_a);
         self.dense_elements /= 2;
         self.dense_in_a = !self.dense_in_a;
         Ok(message)
@@ -572,12 +637,102 @@ impl RamRaSequence {
         {
             return Err(MetalError::RamRaWeightShape { expected, covered });
         }
+        let next_shape = if !self.weights_initialized {
+            (self.e_in_capacity, self.e_out_capacity)
+        } else if self.e_in_elements > 1 {
+            (self.e_in_elements / 2, self.e_out_elements)
+        } else {
+            (1, self.e_out_elements / 2)
+        };
+        if (e_in.len(), e_out.len()) != next_shape {
+            return Err(MetalError::InvalidRamRaState(
+                "resident split-eq weights must contract in low-to-high order",
+            ));
+        }
         Ok(())
     }
 
     fn write_weights(&self, e_in: &[AkitaField], e_out: &[AkitaField]) -> Result<(), MetalError> {
+        // The Gruen suffix weights are uploaded once. Every later prefix
+        // table is the adjacent-pair sum of its resident predecessor; host
+        // slices thereafter supply only the dimensions of that contraction.
+        if self.weights_initialized {
+            return Ok(());
+        }
         write_fields(&self.buffers.e_in, self.e_in_capacity, e_in)?;
         write_fields(&self.buffers.e_out, self.e_out_capacity, e_out)
+    }
+
+    fn encode_weight_contraction(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        e_in_elements: usize,
+        e_out_elements: usize,
+    ) {
+        for (source, destination, current, next) in [
+            (
+                self.e_in_buffer(self.e_in_in_a),
+                self.e_in_buffer(!self.e_in_in_a),
+                self.e_in_elements,
+                e_in_elements,
+            ),
+            (
+                self.e_out_buffer(self.e_out_in_a),
+                self.e_out_buffer(!self.e_out_in_a),
+                self.e_out_elements,
+                e_out_elements,
+            ),
+        ] {
+            if current == next {
+                continue;
+            }
+            encoder.set_compute_pipeline_state(&self.pipelines.contract_eq);
+            encoder.set_buffer(0, Some(source), 0);
+            encoder.set_buffer(1, Some(destination), 0);
+            set_inline_bytes(encoder, 2, &(next as u32));
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: next.div_ceil(SIMD_WIDTH) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: SIMD_WIDTH as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+    }
+
+    fn advance_weights(
+        &mut self,
+        e_in_elements: usize,
+        e_out_elements: usize,
+        e_in_in_a: bool,
+        e_out_in_a: bool,
+    ) {
+        self.weights_initialized = true;
+        self.e_in_elements = e_in_elements;
+        self.e_out_elements = e_out_elements;
+        self.e_in_in_a = e_in_in_a;
+        self.e_out_in_a = e_out_in_a;
+    }
+
+    fn e_in_buffer(&self, in_a: bool) -> &Buffer {
+        if in_a {
+            &self.buffers.e_in
+        } else {
+            &self.buffers.e_in_b
+        }
+    }
+
+    fn e_out_buffer(&self, in_a: bool) -> &Buffer {
+        if in_a {
+            &self.buffers.e_out
+        } else {
+            &self.buffers.e_out_b
+        }
     }
 
     fn lazy_pipeline(&self, width: usize) -> Result<&ComputePipelineState, MetalError> {
@@ -675,6 +830,8 @@ fn device_storage_bytes(buffers: &Buffers) -> usize {
         &buffers.dense_b,
         &buffers.e_in,
         &buffers.e_out,
+        &buffers.e_in_b,
+        &buffers.e_out_b,
         &buffers.partial_a,
         &buffers.partial_b,
     ]
@@ -717,4 +874,7 @@ fn byte_length<T>(elements: usize) -> Result<u64, MetalError> {
 
 const _: () = assert!(size_of::<MessageParams>() == 16);
 const _: () = assert!(size_of::<BranchParams>() == 16);
-const _: () = assert!(size_of::<MaterializeParams>() == 16);
+const _: () = assert!(size_of::<MaterializeParams>() == 32);
+
+#[cfg(test)]
+mod tests;

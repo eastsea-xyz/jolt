@@ -747,8 +747,9 @@ pub(crate) struct MetalBytecodeCycleInputs {
     pub stage_points: Vec<Vec<AkitaField>>,
     pub stage_weights: Vec<AkitaField>,
     pub entry_weight: AkitaField,
-    pub ra0: Vec<AkitaField>,
-    pub ra1: Vec<AkitaField>,
+    pub ra: Vec<Vec<AkitaField>>,
+    pub chunk_bits: usize,
+    pub address_elements: usize,
 }
 
 #[cfg(all(feature = "akita", feature = "metal", target_os = "macos"))]
@@ -760,9 +761,13 @@ pub(crate) fn prepare_metal_bytecode_cycle_shell(
     let dimensions = relation.dimensions();
     let cycles = 1usize << dimensions.log_t();
     let num_ra = dimensions.num_committed_ra_polys();
-    if relation.degree() != 4 || num_ra != 2 || relation.committed_chunk_bits() != 8 {
+    if !(1..=8).contains(&num_ra)
+        || relation.degree() != num_ra + 2
+        || !(1..=16).contains(&relation.committed_chunk_bits())
+        || num_ra * relation.committed_chunk_bits() > 56
+    {
         return Err(KernelError::InvariantViolation {
-            reason: "Metal bytecode cycle shell requires degree four and two 8-bit RA chunks",
+            reason: "Metal bytecode cycle shell RA geometry is unsupported",
         });
     }
 
@@ -803,33 +808,47 @@ pub(crate) fn prepare_metal_bytecode_cycle_shell(
     }));
 
     let entry_index = relation.entry_bytecode_index();
-    let address_eq = eq_table(r_address);
-    let entry_weight = powers[num_stages + 2]
-        * *address_eq
-            .get(entry_index)
+    let address_elements =
+        1usize
+            .checked_shl(dimensions.log_k() as u32)
             .ok_or(KernelError::InvariantViolation {
-                reason: "bytecode entry index exceeds the address domain",
+                reason: "Metal bytecode address domain exceeds usize",
             })?;
+    if r_address.len() != dimensions.log_k() || entry_index >= address_elements {
+        return Err(KernelError::InvariantViolation {
+            reason: "bytecode entry index exceeds the address domain",
+        });
+    }
+    // Only the entry evaluation is needed: avoid allocating the full wide
+    // address equality table just to read this one value.
+    let entry_eq =
+        r_address
+            .iter()
+            .enumerate()
+            .fold(AkitaField::from_u64(1), |value, (bit, challenge)| {
+                value
+                    * if entry_index & (1usize << (r_address.len() - bit - 1)) == 0 {
+                        AkitaField::from_u64(1) - *challenge
+                    } else {
+                        *challenge
+                    }
+            });
+    let entry_weight = powers[num_stages + 2] * entry_eq;
     let chunks = committed_address_chunks(r_address, relation.committed_chunk_bits());
-    if chunks.len() != 2 || chunks.iter().any(|chunk| chunk.len() != 8) {
+    if chunks.len() != num_ra
+        || chunks
+            .iter()
+            .any(|chunk| chunk.len() != relation.committed_chunk_bits())
+    {
         return Err(KernelError::InvariantViolation {
-            reason: "Metal bytecode cycle RA chunk geometry is not two by eight",
+            reason: "Metal bytecode cycle RA chunk count disagrees with the relation",
         });
     }
-    let selectors = (0..2)
-        .map(|index| RaChunkSelector::new(index, 2, 8).map_err(KernelError::from))
-        .collect::<Result<Vec<_>, _>>()?;
-    if selectors[0].shift() != 8 || selectors[1].shift() != 0 {
-        return Err(KernelError::InvariantViolation {
-            reason: "Metal bytecode cycle RA chunks are not most-significant first",
-        });
-    }
-    let ra0 = eq_table(&chunks[0]);
-    let ra1 = eq_table(&chunks[1]);
+    let ra = chunks.iter().map(|chunk| eq_table(chunk)).collect();
     let output_openings = bytecode::read_raf_output_openings(dimensions).bytecode_ra;
-    if output_openings.len() != 2 {
+    if output_openings.len() != num_ra {
         return Err(KernelError::InvariantViolation {
-            reason: "Metal bytecode cycle output opening count is not two",
+            reason: "Metal bytecode cycle output opening count disagrees with RA chunks",
         });
     }
 
@@ -849,8 +868,9 @@ pub(crate) fn prepare_metal_bytecode_cycle_shell(
             stage_points: stage_points.to_vec(),
             stage_weights,
             entry_weight,
-            ra0,
-            ra1,
+            ra,
+            chunk_bits: relation.committed_chunk_bits(),
+            address_elements,
         },
     ))
 }
@@ -956,24 +976,23 @@ pub(crate) struct BytecodeCycleDenseState {
     pub combined: Vec<AkitaField>,
     pub fused_combined: Vec<AkitaField>,
     pub fused_inc: Vec<AkitaField>,
-    pub ra0: Vec<AkitaField>,
-    pub ra1: Vec<AkitaField>,
+    pub ra: Vec<Vec<AkitaField>>,
 }
 
 #[cfg(all(feature = "akita", feature = "metal", target_os = "macos"))]
 impl CycleKernel<AkitaField> {
     pub(crate) fn metal_message(
         &self,
-        evals: [AkitaField; 4],
+        evals: &[AkitaField],
         previous_claim: AkitaField,
     ) -> Result<UnivariatePoly<AkitaField>, SumcheckError<AkitaField>> {
-        if self.degree != 4 {
+        if evals.len() != self.degree {
             return Err(bytecode_cycle_state_error(
-                "Metal bytecode cycle message requires degree four",
+                "Metal bytecode cycle message sample count disagrees with degree",
             ));
         }
         let _ = self.metal_elements()?;
-        Ok(round_poly_from_skipped_evals(&evals, previous_claim))
+        Ok(round_poly_from_skipped_evals(evals, previous_claim))
     }
 
     pub(crate) fn metal_commit_bind(
@@ -998,6 +1017,41 @@ impl CycleKernel<AkitaField> {
         Ok(())
     }
 
+    pub(crate) fn metal_validate_finish(
+        &self,
+        terminal_fields: usize,
+    ) -> Result<(), SumcheckError<AkitaField>> {
+        if self.metal_elements()? != 2
+            || self.progress.bound().checked_add(1) != Some(self.progress.total())
+            || terminal_fields != self.output_openings.len() + 3
+        {
+            return Err(bytecode_cycle_state_error(
+                "Metal bytecode final bind requires the final round and one field per factor",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Store terminal device results as opening metadata; no host fold remains.
+    pub(crate) fn metal_finish_values(
+        &mut self,
+        terminal: &[AkitaField],
+    ) -> Result<(), SumcheckError<AkitaField>> {
+        self.metal_validate_finish(terminal.len())?;
+        self.combined = Polynomial::new(vec![terminal[0]]);
+        self.fused_combined = Polynomial::new(vec![terminal[1]]);
+        self.fused_inc = LazyFusedInc::Dense(Polynomial::new(vec![terminal[2]]));
+        self.ra = LazyFoldedRa::Dense(
+            terminal[3..]
+                .iter()
+                .map(|value| Polynomial::new(vec![*value]))
+                .collect(),
+        );
+        self.progress.advance();
+        self.metal_elements = None;
+        Ok(())
+    }
+
     pub(crate) fn metal_restore_dense(
         &mut self,
         state: BytecodeCycleDenseState,
@@ -1007,8 +1061,6 @@ impl CycleKernel<AkitaField> {
             ("combined", state.combined.len()),
             ("fused_combined", state.fused_combined.len()),
             ("fused_inc", state.fused_inc.len()),
-            ("ra0", state.ra0.len()),
-            ("ra1", state.ra1.len()),
         ] {
             if got != expected {
                 return Err(bytecode_cycle_state_error(format!(
@@ -1016,7 +1068,14 @@ impl CycleKernel<AkitaField> {
                 )));
             }
         }
-        self.ra = LazyFoldedRa::Dense(vec![Polynomial::new(state.ra0), Polynomial::new(state.ra1)]);
+        if state.ra.len() != self.output_openings.len()
+            || state.ra.iter().any(|plane| plane.len() != expected)
+        {
+            return Err(bytecode_cycle_state_error(
+                "Metal bytecode cycle RA readback has the wrong shape",
+            ));
+        }
+        self.ra = LazyFoldedRa::Dense(state.ra.into_iter().map(Polynomial::new).collect());
         self.combined = Polynomial::new(state.combined);
         self.fused_inc = LazyFusedInc::Dense(Polynomial::new(state.fused_inc));
         self.fused_combined = Polynomial::new(state.fused_combined);

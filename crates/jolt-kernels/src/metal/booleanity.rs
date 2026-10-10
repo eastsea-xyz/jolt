@@ -47,6 +47,8 @@ impl Default for BooleanityAddressMetalConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BooleanityMetalConfig {
     pub trace_cutoff_elements: usize,
+    /// Retained for configuration compatibility. Admitted cycle sequences
+    /// keep their polynomial tables resident through the terminal bind.
     pub cutoff_elements: usize,
     pub dispatch: BooleanitySequenceConfig,
 }
@@ -55,7 +57,7 @@ impl Default for BooleanityMetalConfig {
     fn default() -> Self {
         Self {
             trace_cutoff_elements: 1 << 18,
-            cutoff_elements: 1 << 10,
+            cutoff_elements: 2,
             dispatch: BooleanitySequenceConfig {
                 threads_per_threadgroup: Some(256),
                 dense_threads_per_threadgroup: Some(128),
@@ -314,67 +316,37 @@ impl PrepareKernel<AkitaField, Booleanity<AkitaField>> for MetalBackend {
             dispatch.materialize_width = 32;
         }
         let sequence = cpu.metal_offload(&self.context, resident_rows, dispatch)?;
-        Ok(Box::new(MetalBooleanityKernel::new(
-            cpu,
-            sequence,
-            self.config.booleanity_cycle.cutoff_elements,
-        )?))
+        Ok(Box::new(MetalBooleanityKernel::new(cpu, sequence)))
     }
 }
 
 pub(crate) struct MetalBooleanityKernel {
     cpu: OptimizedBooleanityCycleKernel<AkitaField>,
     sequence: Option<BooleanitySequence>,
-    host_tail: Vec<AkitaField>,
-    cutoff_elements: usize,
+    terminal_values: Vec<AkitaField>,
     metal_rounds: usize,
 }
 
 impl MetalBooleanityKernel {
-    fn new(
-        cpu: OptimizedBooleanityCycleKernel<AkitaField>,
-        sequence: BooleanitySequence,
-        cutoff_elements: usize,
-    ) -> Result<Self, SumcheckError<AkitaField>> {
-        let host_elements = cpu
-            .metal_polys()
-            .checked_mul(cutoff_elements)
-            .ok_or_else(|| metal_error("Booleanity host-tail capacity overflow"))?;
-        Ok(Self {
+    fn new(cpu: OptimizedBooleanityCycleKernel<AkitaField>, sequence: BooleanitySequence) -> Self {
+        let terminal_values = vec![AkitaField::zero(); cpu.metal_polys()];
+        Self {
             cpu,
             sequence: Some(sequence),
-            host_tail: vec![AkitaField::zero(); host_elements],
-            cutoff_elements,
+            terminal_values,
             metal_rounds: 0,
-        })
+        }
     }
 
-    fn restore_cpu_tail(&mut self) -> Result<(), SumcheckError<AkitaField>> {
+    fn restore_cpu_terminal(&mut self) -> Result<(), SumcheckError<AkitaField>> {
         let sequence = self
             .sequence
             .take()
             .ok_or_else(|| metal_error("Booleanity sequence disappeared before readback"))?;
-        if !sequence.is_dense() {
-            return Err(metal_error(
-                "Booleanity CPU handoff requires resident dense tables",
-            ));
-        }
-        let elements = sequence.current_elements();
-        let output_len = self
-            .cpu
-            .metal_polys()
-            .checked_mul(elements)
-            .ok_or_else(|| metal_error("Booleanity readback length overflow"))?;
-        if output_len > self.host_tail.len() {
-            return Err(metal_error(
-                "Booleanity readback exceeds the preallocated CPU tail",
-            ));
-        }
         sequence
-            .read_current_tables(&mut self.host_tail[..output_len])
+            .read_terminal_values(&mut self.terminal_values)
             .map_err(|error| metal_error(error.to_string()))?;
-        self.cpu
-            .metal_restore_dense(&self.host_tail[..output_len], elements)
+        self.cpu.metal_restore_dense(&self.terminal_values, 1)
     }
 }
 
@@ -384,9 +356,7 @@ impl ProveRounds<AkitaField> for MetalBooleanityKernel {
     }
 
     fn execution_domain(&self) -> RoundExecutionDomain {
-        if self.sequence.as_ref().is_some_and(|sequence| {
-            !sequence.is_dense() || sequence.current_elements() > self.cutoff_elements
-        }) {
+        if self.sequence.is_some() {
             RoundExecutionDomain::Accelerator
         } else {
             RoundExecutionDomain::Host
@@ -399,22 +369,21 @@ impl ProveRounds<AkitaField> for MetalBooleanityKernel {
         round: usize,
         previous_claim: AkitaField,
     ) -> Result<jolt_poly::UnivariatePoly<AkitaField>, SumcheckError<AkitaField>> {
-        if self.sequence.as_ref().is_some_and(|sequence| {
-            sequence.is_dense() && sequence.current_elements() <= self.cutoff_elements
-        }) {
-            self.restore_cpu_tail()?;
-            return self.cpu.prove_round(bind, round, previous_claim);
+        if round != self.metal_rounds {
+            return Err(metal_error("Booleanity rounds arrived out of order"));
         }
-
+        self.cpu.metal_validate_round(bind.is_some(), round)?;
         if self.sequence.is_some() {
             let message = if let Some(challenge) = bind {
-                self.cpu.metal_bind_offloaded(challenge)?;
-                let (e_in, e_out) = self.cpu.metal_weights()?;
-                self.sequence
+                let (e_in_length, e_out_length) = self.cpu.metal_next_weight_lengths()?;
+                let message = self
+                    .sequence
                     .as_mut()
                     .ok_or_else(|| metal_error("Booleanity sequence disappeared before bind"))?
-                    .bind_and_message(challenge, e_in, e_out)
-                    .map_err(|error| metal_error(error.to_string()))?
+                    .bind_and_message_resident(challenge, e_in_length, e_out_length)
+                    .map_err(|error| metal_error(error.to_string()))?;
+                self.cpu.metal_bind_offloaded(challenge)?;
+                message
             } else {
                 let (e_in, e_out) = self.cpu.metal_weights()?;
                 self.sequence
@@ -423,16 +392,27 @@ impl ProveRounds<AkitaField> for MetalBooleanityKernel {
                     .message(e_in, e_out)
                     .map_err(|error| metal_error(error.to_string()))?
             };
+            let message = self.cpu.metal_message(message, previous_claim)?;
             self.metal_rounds += 1;
-            return self.cpu.metal_message(message, previous_claim);
+            return Ok(message);
         }
 
         self.cpu.prove_round(bind, round, previous_claim)
     }
 
     fn finish_rounds(&mut self, bind: AkitaField) -> Result<(), SumcheckError<AkitaField>> {
-        if self.sequence.is_some() {
-            self.restore_cpu_tail()?;
+        if self.metal_rounds != self.num_rounds() {
+            return Err(metal_error(
+                "Booleanity terminal bind arrived before every round",
+            ));
+        }
+        self.cpu.metal_validate_final_bind()?;
+        if let Some(sequence) = &mut self.sequence {
+            sequence
+                .finish_bind(bind)
+                .map_err(|error| metal_error(error.to_string()))?;
+            self.cpu.metal_bind_offloaded(bind)?;
+            return self.restore_cpu_terminal();
         }
         self.cpu.finish_rounds(bind)
     }
@@ -491,6 +471,8 @@ mod tests {
     use jolt_verifier::stages::relations::ConcreteSumcheck;
     use jolt_verifier::stages::stage6a::booleanity::BooleanityAddressPhaseChallenges;
     use jolt_verifier::stages::stage6b::booleanity::BooleanityInputClaims;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::{RngCore, SeedableRng};
 
     use super::*;
     use crate::optimized::booleanity::{
@@ -668,6 +650,118 @@ mod tests {
                 expected.output_claims(&claims).unwrap()
             );
 
+            let output_points = relation
+                .derive_opening_points(&round_challenges, &points)
+                .unwrap();
+            actual
+                .validate_derived_tables(&relation, &points, &output_points, &challenges)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn committed_nibble_cycle_keeps_all_rounds_resident_and_matches_random_cpu_claims() {
+        let log_t = 10;
+        with_booleanity_backend(log_t, 4, |witness, dimensions| {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x6b04);
+            let random_field = |rng: &mut ChaCha20Rng| {
+                AkitaField::from_u128(
+                    (u128::from(rng.next_u64()) << 64) | u128::from(rng.next_u64()),
+                )
+            };
+            let r_address = (0..dimensions.log_k_chunk)
+                .map(|_| random_field(&mut rng))
+                .collect::<Vec<_>>();
+            let reference_address = (0..dimensions.log_k_chunk)
+                .map(|_| random_field(&mut rng))
+                .collect::<Vec<_>>();
+            let reference_cycle = (0..log_t)
+                .map(|_| random_field(&mut rng))
+                .collect::<Vec<_>>();
+            let relation = Booleanity::new(
+                LatticeBooleanityDimensions::new(dimensions).unwrap(),
+                r_address.clone(),
+                reference_address,
+                reference_cycle,
+            );
+            let claims = BooleanityInputClaims {
+                address_phase: random_field(&mut rng),
+            };
+            let points = BooleanityInputClaims {
+                address_phase: r_address,
+            };
+            let challenges = BooleanityCyclePhaseChallenges {
+                gamma: random_field(&mut rng),
+            };
+            let inputs = || ProverInputs {
+                relation: &relation,
+                claims: &claims,
+                points: &points,
+                challenges: &challenges,
+            };
+            let mut expected = OptimizedBooleanityCycle
+                .prepare(&mut ProofSession::default(), witness, inputs())
+                .unwrap();
+            let metal = MetalBackend::new(super::super::MetalConfig {
+                booleanity_cycle: BooleanityMetalConfig {
+                    trace_cutoff_elements: 2,
+                    // The previous CPU-tail threshold must not cause table
+                    // readback in the admitted resident cycle route.
+                    cutoff_elements: 1 << log_t,
+                    dispatch: BooleanitySequenceConfig {
+                        materialize_width: 8,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            })
+            .unwrap();
+            let rows = collect_instruction_cycle_rows::<AkitaField>(witness, 1 << log_t).unwrap();
+            let resident_rows = metal
+                .context
+                .prepare_booleanity_rows(InstructionCycleRow::metal_booleanity_rows(&rows))
+                .unwrap();
+            let mut session = ProofSession::default();
+            session.park(resident_rows);
+            let mut actual = metal.prepare(&mut session, witness, inputs()).unwrap();
+            let mut claim = claims.address_phase;
+            let mut bind = None;
+            let mut round_challenges = Vec::new();
+            assert!(actual
+                .prove_round(Some(AkitaField::from_u64(7)), 0, claim)
+                .is_err());
+            assert!(actual.prove_round(None, 1, claim).is_err());
+            assert!(actual.finish_rounds(AkitaField::from_u64(7)).is_err());
+            for round in 0..log_t {
+                assert_eq!(actual.execution_domain(), RoundExecutionDomain::Accelerator);
+                assert!(actual.finish_rounds(AkitaField::from_u64(7)).is_err());
+                if round > 0 {
+                    assert!(actual.prove_round(None, round, claim).is_err());
+                }
+                assert!(actual.prove_round(bind, round + 1, claim).is_err());
+                let expected_poly = expected.prove_round(bind, round, claim).unwrap();
+                let actual_poly = actual.prove_round(bind, round, claim).unwrap();
+                assert_eq!(actual_poly, expected_poly, "nibble cycle round {round}");
+                assert!(actual.prove_round(bind, round, claim).is_err());
+                let challenge = if round < 2 {
+                    AkitaField::from_u64(round as u64)
+                } else {
+                    random_field(&mut rng)
+                };
+                claim = expected_poly.evaluate(challenge);
+                round_challenges.push(challenge);
+                bind = Some(challenge);
+            }
+            let final_bind = *round_challenges.last().unwrap();
+            expected.finish_rounds(final_bind).unwrap();
+            actual.finish_rounds(final_bind).unwrap();
+            assert!(actual.finish_rounds(final_bind).is_err());
+            assert!(actual.prove_round(None, log_t, claim).is_err());
+            assert_eq!(actual.execution_domain(), RoundExecutionDomain::Host);
+            assert_eq!(
+                actual.output_claims(&claims).unwrap(),
+                expected.output_claims(&claims).unwrap()
+            );
             let output_points = relation
                 .derive_opening_points(&round_challenges, &points)
                 .unwrap();

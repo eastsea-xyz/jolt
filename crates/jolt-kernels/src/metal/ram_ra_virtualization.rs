@@ -13,6 +13,8 @@ use jolt_verifier::stages::stage6b::ram_ra_virtualization::{
     RamRaVirtualization, RamRaVirtualizationOutputClaims,
 };
 use jolt_witness::JoltWitnessPlane;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use super::backend::MetalBackend;
 use super::ram_cycle_family::shared_ram_cycle_family_owner;
@@ -46,7 +48,7 @@ pub struct RamRaVirtualizationMetalConfig {
 impl Default for RamRaVirtualizationMetalConfig {
     fn default() -> Self {
         Self {
-            trace_cutoff_elements: 1 << 25,
+            trace_cutoff_elements: 1 << 22,
         }
     }
 }
@@ -57,12 +59,12 @@ struct HostSparseRamRaVirtualizationKernel {
 }
 
 struct MetalRamRaVirtualizationKernel {
-    sequence: RamRaSequence,
+    sequence: Option<RamRaSequence>,
     gruen: GruenSplitEqPolynomial<AkitaField>,
     log_t: usize,
     num_factors: usize,
     next_round: usize,
-    final_values: Option<[AkitaField; 3]>,
+    final_values: Option<[AkitaField; 8]>,
 }
 
 #[cfg(feature = "allocative")]
@@ -97,25 +99,32 @@ impl ProveRounds<AkitaField> for MetalRamRaVirtualizationKernel {
         round: usize,
         previous_claim: AkitaField,
     ) -> Result<UnivariatePoly<AkitaField>, SumcheckError<AkitaField>> {
-        if round != self.next_round || (round == 0) != bind.is_none() {
+        if round >= self.log_t
+            || self.final_values.is_some()
+            || round != self.next_round
+            || (round == 0) != bind.is_none()
+        {
             return Err(device_error(
                 "RAM RA device sequence received an out-of-order round",
             ));
         }
+        let sequence = self.sequence.as_mut().ok_or_else(|| {
+            device_error("RAM RA device sequence has already released its terminal state")
+        })?;
         if let Some(challenge) = bind {
             self.gruen.bind(challenge);
         }
-        let _round_span = if self.sequence.is_dense() {
+        let _round_span = if sequence.is_dense() {
             tracing::info_span!(
                 "MetalRamRaVirtualization::dense_round",
-                elements = self.sequence.current_elements()
+                elements = sequence.current_elements()
             )
             .entered()
         } else {
             tracing::info_span!(
                 "MetalRamRaVirtualization::lazy_round",
-                elements = self.sequence.current_elements(),
-                branch_width = self.sequence.branch_width()
+                elements = sequence.current_elements(),
+                branch_width = sequence.branch_width()
             )
             .entered()
         };
@@ -123,8 +132,8 @@ impl ProveRounds<AkitaField> for MetalRamRaVirtualizationKernel {
             let e_in = self.gruen.e_in_current();
             let e_out = self.gruen.e_out_current();
             match bind {
-                Some(challenge) => self.sequence.bind_and_message(challenge, e_in, e_out),
-                None => self.sequence.message(e_in, e_out),
+                Some(challenge) => sequence.bind_and_message(challenge, e_in, e_out),
+                None => sequence.message(e_in, e_out),
             }
             .map_err(|error| device_error(error.to_string()))?
         };
@@ -140,12 +149,17 @@ impl ProveRounds<AkitaField> for MetalRamRaVirtualizationKernel {
                 "RAM RA device sequence finished outside its terminal state",
             ));
         }
+        let values = self
+            .sequence
+            .as_mut()
+            .ok_or_else(|| device_error("RAM RA device sequence has no terminal state"))?
+            .finish_bind(bind)
+            .map_err(|error| device_error(error.to_string()))?;
         self.gruen.bind(bind);
-        self.final_values = Some(
-            self.sequence
-                .finish_bind(bind)
-                .map_err(|error| device_error(error.to_string()))?,
-        );
+        self.final_values = Some(values);
+        // The terminal values are the only remaining consumer data. Release
+        // the resident buffers and their zero-copy address owner immediately.
+        self.sequence = None;
         Ok(())
     }
 }
@@ -329,9 +343,10 @@ impl PrepareKernel<AkitaField, RamRaVirtualization<AkitaField>> for MetalBackend
         }
 
         let log_k = r_address.len();
-        if chunk_bits == 8
-            && (2..=3).contains(&chunks.len())
-            && chunks.iter().all(|chunk| chunk.len() == 8)
+        if cycles >= 32
+            && ((chunk_bits == 4 && (2..=8).contains(&chunks.len()))
+                || (chunk_bits == 8 && (2..=3).contains(&chunks.len())))
+            && chunks.iter().all(|chunk| chunk.len() == chunk_bits)
         {
             let columns = RamAccessColumns::shared(session, witness, log_t)?;
             let address_domain = 1usize
@@ -354,6 +369,12 @@ impl PrepareKernel<AkitaField, RamRaVirtualization<AkitaField>> for MetalBackend
                 });
             }
             let sparse_owner_removed = session.take::<Arc<RamCycleFamilyOwner>>().is_some();
+            #[cfg(feature = "parallel")]
+            let chunk_tables = chunks
+                .par_iter()
+                .flat_map_iter(|chunk| eq_table(chunk))
+                .collect::<Vec<_>>();
+            #[cfg(not(feature = "parallel"))]
             let chunk_tables = chunks
                 .iter()
                 .flat_map(|chunk| eq_table(chunk))
@@ -383,8 +404,10 @@ impl PrepareKernel<AkitaField, RamRaVirtualization<AkitaField>> for MetalBackend
                 cycles,
                 log_t,
                 log_k,
-                requested = "device_cycle_sequence_v1",
-                selected = "device_cycle_sequence_v1",
+                requested = "device_cycle_sequence_v2",
+                selected = "device_cycle_sequence_v2",
+                committed_chunk_bits = chunk_bits,
+                factors = chunks.len(),
                 fallback_reason = "none",
                 source_kind = "shared_ram_address_column_zero_copy",
                 source_bytes = cycles * std::mem::size_of::<u32>(),
@@ -400,7 +423,7 @@ impl PrepareKernel<AkitaField, RamRaVirtualization<AkitaField>> for MetalBackend
                 .ram_ra_virtualization_metal_sequences
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Box::new(MetalRamRaVirtualizationKernel {
-                sequence,
+                sequence: Some(sequence),
                 gruen,
                 log_t,
                 num_factors: chunks.len(),
@@ -558,10 +581,172 @@ mod tests {
             .collect()
     }
 
+    fn assert_device_call_rejected_without_mutation(
+        kernel: &mut MetalRamRaVirtualizationKernel,
+        call: impl FnOnce(&mut MetalRamRaVirtualizationKernel) -> Result<(), SumcheckError<AkitaField>>,
+    ) {
+        let gruen = kernel.gruen.clone();
+        let state = (
+            kernel.next_round,
+            kernel.final_values,
+            kernel.sequence.as_ref().map(|sequence| {
+                (
+                    sequence.is_dense(),
+                    sequence.current_elements(),
+                    sequence.branch_width(),
+                )
+            }),
+        );
+        assert!(call(kernel).is_err());
+        assert_eq!(kernel.gruen, gruen);
+        assert_eq!(
+            (
+                kernel.next_round,
+                kernel.final_values,
+                kernel.sequence.as_ref().map(|sequence| (
+                    sequence.is_dense(),
+                    sequence.current_elements(),
+                    sequence.branch_width(),
+                )),
+            ),
+            state
+        );
+    }
+
+    #[test]
+    fn ram_ra_device_wrapper_rejects_extra_and_duplicate_calls_before_mutation() {
+        use crate::metal::ram_records::NO_ACCESS;
+        use crate::metal::solinas::SolinasMetal;
+
+        let log_t = 6;
+        let rows = 1usize << log_t;
+        let addresses = (0..rows)
+            .map(|row| {
+                if row % 5 == 0 {
+                    NO_ACCESS
+                } else {
+                    (row as u32).wrapping_mul(0x9e37_79b9) & ((1 << 21) - 1)
+                }
+            })
+            .collect::<Vec<_>>();
+        let r_address = point(11, 21);
+        let r_cycle = point(71, log_t);
+        let chunk_tables = committed_address_chunks(&r_address, 4)
+            .iter()
+            .flat_map(|chunk| eq_table(chunk))
+            .collect::<Vec<_>>();
+        let eq_cycle = EqPolynomial::<AkitaField>::evals(&r_cycle, None);
+        let initial_claim = addresses
+            .iter()
+            .enumerate()
+            .map(|(row, address)| {
+                if *address == NO_ACCESS {
+                    AkitaField::from_u64(0)
+                } else {
+                    (0..6).fold(eq_cycle[row], |product, factor| {
+                        let index = (*address >> ((5 - factor) * 4)) as usize & 15;
+                        product * chunk_tables[factor * 16 + index]
+                    })
+                }
+            })
+            .sum();
+        let columns = Arc::new(RamAccessColumns::from_direct_addresses(
+            addresses,
+            rows,
+            1 << 21,
+        ));
+        let context = SolinasMetal::for_akita().unwrap();
+        let prepare = || {
+            let gruen = GruenSplitEqPolynomial::new(&r_cycle, BindingOrder::LowToHigh);
+            MetalRamRaVirtualizationKernel {
+                sequence: Some(
+                    context
+                        .prepare_ram_ra_sequence(
+                            Arc::clone(&columns),
+                            &chunk_tables,
+                            6,
+                            gruen.e_in_current().len(),
+                            gruen.e_out_current().len(),
+                        )
+                        .unwrap(),
+                ),
+                gruen,
+                log_t,
+                num_factors: 6,
+                next_round: 0,
+                final_values: None,
+            }
+        };
+        let mut expected = prepare();
+        let mut actual = prepare();
+        let challenges = point(307, log_t);
+        let mut claim = initial_claim;
+        for round in 0..log_t {
+            let bind = round.checked_sub(1).map(|previous| challenges[previous]);
+            assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+                kernel.finish_rounds(challenges[round])
+            });
+            assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+                kernel
+                    .prove_round(Some(challenges[round]), round + 1, claim)
+                    .map(|_| ())
+            });
+            assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+                kernel
+                    .prove_round(
+                        if round == 0 {
+                            Some(challenges[0])
+                        } else {
+                            None
+                        },
+                        round,
+                        claim,
+                    )
+                    .map(|_| ())
+            });
+            let expected_poly = expected.prove_round(bind, round, claim).unwrap();
+            let actual_poly = actual.prove_round(bind, round, claim).unwrap();
+            assert_eq!(actual_poly.coefficients(), expected_poly.coefficients());
+            assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+                kernel.prove_round(bind, round, claim).map(|_| ())
+            });
+            claim = expected_poly.evaluate(challenges[round]);
+        }
+        // This formerly bound Gruen down to index zero before the sequence
+        // rejected an extra dense transition, corrupting the valid finish.
+        assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+            kernel
+                .prove_round(Some(challenges[0]), log_t, claim)
+                .map(|_| ())
+        });
+        assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+            kernel
+                .prove_round(Some(challenges[0]), usize::MAX, claim)
+                .map(|_| ())
+        });
+        let last = challenges[log_t - 1];
+        expected.finish_rounds(last).unwrap();
+        actual.finish_rounds(last).unwrap();
+        assert!(expected.sequence.is_none());
+        assert!(actual.sequence.is_none());
+        assert_eq!(actual.gruen, expected.gruen);
+        assert_eq!(actual.final_values, expected.final_values);
+        assert_eq!(actual.execution_domain(), RoundExecutionDomain::Host);
+        assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+            kernel.finish_rounds(last)
+        });
+        assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+            kernel.prove_round(Some(last), log_t, claim).map(|_| ())
+        });
+        assert_device_call_rejected_without_mutation(&mut actual, |kernel| {
+            kernel.prove_round(None, 0, claim).map(|_| ())
+        });
+    }
+
     #[test]
     fn topology_sparse_sequence_matches_optimized_cpu() {
         let shape = FixtureShape {
-            log_t: 5,
+            log_t: 4,
             ram_k: 64,
         };
         let ops = vec![
@@ -655,6 +840,116 @@ mod tests {
                 .unwrap();
             drop(actual);
             assert!(owner_weak.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn topology_six_nibble_device_sequence_matches_optimized_cpu() {
+        let shape = FixtureShape {
+            log_t: 9,
+            ram_k: 1 << 21,
+        };
+        let ops = (0..1usize << (shape.log_t - 1))
+            .map(|cycle| {
+                let word = ((cycle as u64).wrapping_mul(0x9e37_79b9) & ((1 << 21) - 1)) | 2;
+                match cycle % 5 {
+                    0 => RamOp::None,
+                    1 => RamOp::Write {
+                        word,
+                        post: u64::MAX - cycle as u64,
+                    },
+                    _ => RamOp::Read { word },
+                }
+            })
+            .collect();
+        with_ram_fixture_backend(shape, ops, |witness| {
+            let r_address = point(31, shape.log_k());
+            let r_cycle = point(101, shape.log_t);
+            let chunks = committed_address_chunks(&r_address, 4);
+            assert_eq!(chunks.len(), 6);
+            let relation = RamRaVirtualization::<AkitaField>::new(
+                RamRaVirtualizationDimensions::new(shape.log_t, chunks.len()),
+                r_address,
+                r_cycle.clone(),
+                4,
+            );
+            let eq_cycle = EqPolynomial::<AkitaField>::evals(&r_cycle, None);
+            let folded = chunks
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    address_fold::<AkitaField>(witness, committed_ram_ra(index), shape.log_t, chunk)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let input_claim = (0..1usize << shape.log_t)
+                .map(|cycle| {
+                    folded
+                        .iter()
+                        .fold(eq_cycle[cycle], |product, values| product * values[cycle])
+                })
+                .sum();
+            let claims = RamRaVirtualizationInputClaims {
+                ram_ra_reduced: input_claim,
+            };
+            let points = RamRaVirtualizationInputClaims::<Vec<AkitaField>>::default();
+            let challenges = NoChallenges::default();
+            let inputs = || ProverInputs {
+                relation: &relation,
+                claims: &claims,
+                points: &points,
+                challenges: &challenges,
+            };
+            let mut expected = OptimizedBackend
+                .prepare(&mut ProofSession::default(), witness, inputs())
+                .unwrap();
+            let mut config = MetalConfig::default();
+            config.ram_ra_virtualization.trace_cutoff_elements = 1 << shape.log_t;
+            let metal = MetalBackend::new(config).unwrap();
+            let mut session = ProofSession::default();
+            let owner =
+                shared_ram_cycle_family_owner(&mut session, witness, shape.log_t, shape.log_k())
+                    .unwrap()
+                    .unwrap();
+            let owner_weak = Arc::downgrade(&owner);
+            let columns_weak = Arc::downgrade(
+                session
+                    .state::<Arc<RamAccessColumns>>()
+                    .expect("prepared RAM address column"),
+            );
+            drop(owner);
+            let mut actual =
+                PrepareKernel::prepare(&metal, &mut session, witness, inputs()).unwrap();
+            assert_eq!(metal.ram_ra_virtualization_metal_sequences(), 1);
+            assert_eq!(metal.ram_ra_virtualization_sparse_sequences(), 0);
+            assert_eq!(actual.execution_domain(), RoundExecutionDomain::Accelerator);
+            assert!(session.state::<Arc<RamCycleFamilyOwner>>().is_none());
+            assert!(session.state::<Arc<RamAccessColumns>>().is_none());
+            assert!(owner_weak.upgrade().is_none());
+            assert!(columns_weak.upgrade().is_some());
+            let round_challenges = point(307, shape.log_t);
+            run_lockstep(
+                expected.as_mut(),
+                actual.as_mut(),
+                input_claim,
+                &round_challenges,
+            );
+            // Terminal extraction releases the zero-copy owner while the
+            // kernel remains alive for claims and derived-table validation.
+            assert!(columns_weak.upgrade().is_none());
+            assert_eq!(actual.execution_domain(), RoundExecutionDomain::Host);
+            assert_eq!(
+                actual.output_claims(&claims).unwrap(),
+                expected.output_claims(&claims).unwrap()
+            );
+            let output_points = relation
+                .derive_opening_points(&round_challenges, &points)
+                .unwrap();
+            actual
+                .validate_derived_tables(&relation, &points, &output_points, &challenges)
+                .unwrap();
+            drop(actual);
+            assert!(columns_weak.upgrade().is_none());
         });
     }
 }

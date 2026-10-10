@@ -8,6 +8,9 @@ use super::{
     PipelineLimits, SolinasMetal, AKITA_OFFSET_FFFFA7F7,
 };
 
+mod wide;
+pub(crate) use wide::{BytecodeCycleWideInputs, BytecodeCycleWideSequence};
+
 pub const BYTECODE_CYCLE_TABLES: usize = 5;
 pub const BYTECODE_CYCLE_SAMPLES: usize = 4;
 
