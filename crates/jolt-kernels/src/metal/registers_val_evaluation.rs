@@ -1,10 +1,10 @@
-use std::mem::size_of;
+use std::{mem::size_of, sync::Arc};
 
 use jolt_claims::protocols::jolt::geometry::dimensions::REGISTER_ADDRESS_BITS;
 use jolt_claims::protocols::jolt::geometry::registers::rd_inc_val_evaluation;
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
 use jolt_field::Zero as _;
-use jolt_sumcheck::{ProveRounds, SumcheckError};
+use jolt_sumcheck::{ProveRounds, RoundExecutionDomain, SumcheckError};
 use jolt_verifier::stages::relations::{
     ConcreteSumcheckChallenges, SumcheckInputClaims, SumcheckInputPoints, SumcheckOutputPoints,
 };
@@ -14,6 +14,7 @@ use jolt_verifier::stages::stage5::registers_val_evaluation::{
 use jolt_witness::{collect_bundles, JoltWitnessPlane};
 
 use super::backend::MetalBackend;
+use super::registers_read_write::SharedPackedRegisterRows;
 use super::solinas::{
     MetalError, PendingRegistersValFirstMessage, RegistersValDenseConfig,
     RegistersValFirstMessageConfig, RegistersValFirstMessageInvocation,
@@ -136,9 +137,9 @@ impl PrepareKernel<AkitaField, RegistersValEvaluation<AkitaField>> for MetalBack
                     reason: "registers value found an unexpected Stage-1 source lease",
                 });
             }
-            if resident_from_stage1
-                || cycles < config.trace_cutoff_elements
+            if cycles < config.trace_cutoff_elements
                 || cycles <= config.cutoff_elements
+                || (resident_from_stage1 && log_t > 28)
             {
                 return OptimizedRegistersValEvaluation.prepare(session, witness, cpu_inputs());
             }
@@ -197,6 +198,59 @@ impl PrepareKernel<AkitaField, RegistersValEvaluation<AkitaField>> for MetalBack
                 });
             }
             record_route(cycles, resident_route, resident_route, "none");
+            return Ok(self.finish_metal_registers_val_prepare(
+                invocation,
+                r_cycle,
+                cutoff_elements,
+                config,
+            ));
+        }
+
+        if let Some(shared) = session.take::<SharedPackedRegisterRows>() {
+            let physical_rows = shared.rows.device_view().rows();
+            if shared.cycles != cycles || physical_rows == 0 || physical_rows > cycles {
+                return Err(KernelError::InvariantViolation {
+                    reason: "registers value packed source has the wrong cycle domain",
+                });
+            }
+            let prepare_span = tracing::info_span!(
+                "MetalRegistersValEvaluation::prepare",
+                cycles,
+                cutoff_elements,
+                source = "packed_register_rows_v1",
+                row_layout = "packed_register_cycle_row_40_v1",
+                physical_rows,
+                resident_source_bytes = shared.rows.device_view().allocation_bytes(),
+                inc_upload_bytes = 0,
+                rd_upload_bytes = 0,
+                additional_source_row_scans = 0,
+            );
+            let invocation = {
+                let _guard = prepare_span.enter();
+                self.context
+                    .prepare_registers_val_first_message_packed_rows(
+                        Arc::clone(&shared.rows),
+                        cycles,
+                        r_address,
+                        r_cycle,
+                        config.first_message,
+                    )
+            };
+            let invocation = match invocation {
+                Ok(invocation) => invocation,
+                Err(MetalError::BufferTooLong { .. } | MetalError::WorkingSetTooLarge { .. }) => {
+                    record_route(cycles, "packed_register_rows_v1", "cpu", "capacity");
+                    return OptimizedRegistersValEvaluation.prepare(session, witness, cpu_inputs());
+                }
+                Err(error) => return Err(metal_prepare_error(error)),
+            };
+            let _ = session.take::<SharedRdIndices>();
+            record_route(
+                cycles,
+                "packed_register_rows_v1",
+                "packed_register_rows_v1",
+                "none",
+            );
             return Ok(self.finish_metal_registers_val_prepare(
                 invocation,
                 r_cycle,
@@ -517,6 +571,21 @@ impl ProveRounds<AkitaField> for MetalRegistersValEvaluationKernel {
         self.cpu.num_rounds()
     }
 
+    fn execution_domain(&self) -> RoundExecutionDomain {
+        if self.should_restore()
+            || matches!(
+                &self.state,
+                RegistersValState::CpuTail
+                    | RegistersValState::Finished
+                    | RegistersValState::Failed
+            )
+        {
+            RoundExecutionDomain::Host
+        } else {
+            RoundExecutionDomain::Accelerator
+        }
+    }
+
     fn prove_round(
         &mut self,
         bind: Option<AkitaField>,
@@ -629,13 +698,296 @@ mod tests {
         RegistersValEvaluationInputClaims, RegistersValEvaluationOutputClaims,
     };
     use jolt_witness::testing::with_sample_backend_at_geometry;
-    use jolt_witness::JoltWitnessOracle;
+    use jolt_witness::{JoltWitnessOracle, ProgramSource, RowSource};
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::{RngCore, SeedableRng};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use super::*;
+    use crate::metal::registers_read_write::SharedPackedRegisterRows;
+    use crate::optimized::parity::run_lockstep;
+    use crate::optimized::registers_read_write::test_support::TraceFixture;
+    use crate::optimized::registers_read_write::AlignedPackedRegisterRows;
     fn point(len: usize, seed: u64) -> Vec<AkitaField> {
         (0..len as u64)
             .map(|index| AkitaField::from_u64(seed + 37 * index + 5))
             .collect()
+    }
+
+    fn random_point(len: usize, random: &mut ChaCha8Rng) -> Vec<AkitaField> {
+        (0..len)
+            .map(|_| {
+                AkitaField::from_u128(
+                    u128::from(random.next_u64()) | (u128::from(random.next_u64()) << 64),
+                )
+            })
+            .collect()
+    }
+
+    struct PrepareSpy<'a> {
+        witness: &'a dyn JoltWitnessPlane<AkitaField>,
+        increment_tables: AtomicUsize,
+        row_walks: AtomicUsize,
+    }
+
+    impl JoltWitnessOracle<AkitaField> for PrepareSpy<'_> {
+        fn shape(
+            &self,
+            id: JoltPolynomialId,
+        ) -> Result<jolt_witness::Shape, jolt_witness::WitnessError> {
+            self.witness.shape(id)
+        }
+
+        fn oracle_table(
+            &self,
+            id: JoltPolynomialId,
+        ) -> Result<Vec<AkitaField>, jolt_witness::WitnessError> {
+            if id == rd_inc_val_evaluation().polynomial_id() {
+                let _ = self.increment_tables.fetch_add(1, Ordering::Relaxed);
+            }
+            self.witness.oracle_table(id)
+        }
+
+        fn committed_order(
+            &self,
+        ) -> Result<
+            Vec<jolt_claims::protocols::jolt::JoltCommittedPolynomial>,
+            jolt_witness::WitnessError,
+        > {
+            self.witness.committed_order()
+        }
+    }
+
+    impl RowSource for PrepareSpy<'_> {
+        fn visit_chunks(
+            &self,
+            range: std::ops::Range<usize>,
+            chunk_size: usize,
+            visitor: &mut jolt_witness::ChunkVisitor<'_>,
+        ) -> Result<(), jolt_witness::WitnessError> {
+            let _ = self.row_walks.fetch_add(1, Ordering::Relaxed);
+            self.witness.visit_chunks(range, chunk_size, visitor)
+        }
+
+        fn random_access(&self) -> Option<jolt_witness::RandomAccessRows> {
+            self.witness.random_access()
+        }
+    }
+
+    impl ProgramSource for PrepareSpy<'_> {
+        fn program_preprocessing(&self) -> &jolt_program::preprocess::JoltProgramPreprocessing {
+            self.witness.program_preprocessing()
+        }
+    }
+
+    #[test]
+    fn native_trace_shapes_route_to_metal() {
+        let config = super::super::MetalConfig::production();
+        for log_t in [22, 24] {
+            let cycles = 1usize << log_t;
+            assert!(
+                cycles >= config.registers_val_evaluation.trace_cutoff_elements,
+                "T{log_t} must dispatch the register value-evaluation sequence",
+            );
+            assert!(cycles > config.registers_val_evaluation.cutoff_elements);
+        }
+    }
+
+    #[test]
+    fn random_register_values_match_cpu_through_all_rounds() {
+        for (log_t, seed) in [(8, 5), (9, 37), (10, 107)] {
+            check_random_register_values(log_t, seed, false, false);
+        }
+    }
+
+    #[test]
+    fn packed_source_is_consumed_without_increment_materialization_or_row_scans() {
+        for (log_t, seed) in [(8, 7), (9, 41), (10, 109)] {
+            check_random_register_values(log_t, seed, true, false);
+        }
+    }
+
+    #[test]
+    fn register_read_write_producer_carries_packed_value_source() {
+        check_random_register_values(8, 211, true, true);
+    }
+
+    fn check_random_register_values(
+        log_t: usize,
+        seed: u64,
+        packed_source: bool,
+        real_producer: bool,
+    ) {
+        let mut random = ChaCha8Rng::seed_from_u64(seed);
+        let mut fixture = TraceFixture::new();
+        for cycle in 0..((1 << log_t) - 17) {
+            if cycle % 13 == 0 {
+                fixture.noop();
+                continue;
+            }
+            let mut operand = || {
+                let value = random.next_u32();
+                (value % 7 != 0).then_some(if packed_source {
+                    (value % 32 + 96) as u8
+                } else {
+                    (value % 128) as u8
+                })
+            };
+            fixture.op(operand(), operand(), operand());
+        }
+        fixture.with_plane(log_t, |witness| {
+            let relation = RegistersValEvaluation::new(TraceDimensions::new(log_t));
+            let input_point = random_point(REGISTER_ADDRESS_BITS + log_t, &mut random);
+            let table = JoltWitnessOracle::<AkitaField>::oracle_table(
+                witness,
+                JoltPolynomialId::Virtual(JoltVirtualPolynomial::RegistersVal),
+            )
+            .unwrap();
+            let input_claim = Polynomial::new(table).evaluate(&input_point);
+            let claims = RegistersValEvaluationInputClaims {
+                registers_val: input_claim,
+            };
+            let points = RegistersValEvaluationInputClaims {
+                registers_val: input_point,
+            };
+            let challenges = NoChallenges::default();
+            let inputs = || ProverInputs {
+                relation: &relation,
+                claims: &claims,
+                points: &points,
+                challenges: &challenges,
+            };
+            let metal = MetalBackend::new(super::super::MetalConfig {
+                registers_read_write: super::super::RegistersReadWriteMetalConfig {
+                    trace_cutoff_elements: 2,
+                },
+                registers_val_evaluation: RegistersValEvaluationMetalConfig {
+                    trace_cutoff_elements: 2,
+                    cutoff_elements: 16,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+            let mut expected = OptimizedRegistersValEvaluation
+                .prepare(&mut ProofSession::default(), witness, inputs())
+                .unwrap();
+            let mut session = ProofSession::default();
+            if real_producer {
+                use crate::optimized::registers_read_write::OptimizedRegistersReadWrite;
+                use jolt_claims::protocols::jolt::geometry::dimensions::ReadWriteDimensions;
+                use jolt_verifier::stages::stage4::registers_read_write_checking::{
+                    RegistersReadWriteChallenges, RegistersReadWriteChecking,
+                    RegistersReadWriteInputClaims,
+                };
+
+                let producer_relation = RegistersReadWriteChecking::new(ReadWriteDimensions::new(
+                    log_t,
+                    REGISTER_ADDRESS_BITS,
+                    log_t,
+                    0,
+                ));
+                let r_cycle = random_point(log_t, &mut random);
+                let evaluate = |id| {
+                    let table = JoltWitnessOracle::<AkitaField>::oracle_table(
+                        witness,
+                        JoltPolynomialId::Virtual(id),
+                    )
+                    .unwrap();
+                    Polynomial::new(table).evaluate(&r_cycle)
+                };
+                let producer_claims = RegistersReadWriteInputClaims {
+                    rd_write_value: evaluate(JoltVirtualPolynomial::RdWriteValue),
+                    rs1_value: evaluate(JoltVirtualPolynomial::Rs1Value),
+                    rs2_value: evaluate(JoltVirtualPolynomial::Rs2Value),
+                };
+                let producer_points = RegistersReadWriteInputClaims {
+                    rd_write_value: r_cycle.clone(),
+                    rs1_value: r_cycle.clone(),
+                    rs2_value: r_cycle,
+                };
+                let gamma = AkitaField::from_u64(317);
+                let producer_challenges = RegistersReadWriteChallenges { gamma };
+                let producer_inputs = || ProverInputs {
+                    relation: &producer_relation,
+                    claims: &producer_claims,
+                    points: &producer_points,
+                    challenges: &producer_challenges,
+                };
+                let mut producer = metal
+                    .prepare(&mut session, witness, producer_inputs())
+                    .unwrap();
+                let mut producer_expected = OptimizedRegistersReadWrite
+                    .prepare(&mut ProofSession::default(), witness, producer_inputs())
+                    .unwrap();
+                let input_claim = producer_claims.rd_write_value
+                    + gamma * producer_claims.rs1_value
+                    + gamma * gamma * producer_claims.rs2_value;
+                let producer_binds = random_point(log_t + REGISTER_ADDRESS_BITS, &mut random);
+                run_lockstep(
+                    producer_expected.as_mut(),
+                    producer.as_mut(),
+                    input_claim,
+                    &producer_binds,
+                );
+                assert_eq!(
+                    producer.output_claims(&producer_claims).unwrap(),
+                    producer_expected.output_claims(&producer_claims).unwrap()
+                );
+                drop(producer);
+                assert!(session.state::<SharedPackedRegisterRows>().is_some());
+            } else if packed_source {
+                let access = witness.random_access().unwrap();
+                let rows = Arc::new(
+                    AlignedPackedRegisterRows::collect(&access, access.physical_rows(), false)
+                        .unwrap(),
+                );
+                session.park(SharedPackedRegisterRows {
+                    rows,
+                    cycles: 1 << log_t,
+                });
+            }
+            let spy = PrepareSpy {
+                witness,
+                increment_tables: AtomicUsize::new(0),
+                row_walks: AtomicUsize::new(0),
+            };
+            let mut actual = metal.prepare(&mut session, &spy, inputs()).unwrap();
+            assert_eq!(metal.registers_val_sequences(), 1);
+            assert_eq!(
+                spy.increment_tables.load(Ordering::Relaxed),
+                usize::from(!packed_source),
+                "packed rows must avoid materializing the increment oracle",
+            );
+            assert!(session.state::<SharedPackedRegisterRows>().is_none());
+            if packed_source {
+                assert_eq!(spy.row_walks.load(Ordering::Relaxed), 0);
+            }
+            let round_challenges = random_point(log_t, &mut random);
+            run_lockstep(
+                expected.as_mut(),
+                actual.as_mut(),
+                input_claim,
+                &round_challenges,
+            );
+            assert_eq!(
+                actual.output_claims(&claims).unwrap(),
+                expected.output_claims(&claims).unwrap(),
+            );
+            let output_points = relation
+                .derive_opening_points(&round_challenges, &points)
+                .unwrap();
+            actual
+                .validate_derived_tables(&relation, &points, &output_points, &challenges)
+                .unwrap();
+            if packed_source {
+                assert_eq!(spy.increment_tables.load(Ordering::Relaxed), 0);
+                assert_eq!(spy.row_walks.load(Ordering::Relaxed), 0);
+            }
+        });
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use std::{
     cell::Cell,
+    ffi::c_void,
     mem::{size_of, size_of_val},
     slice,
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,6 +20,9 @@ use super::{
     buffer_from_slice, completed_command_gpu_time, set_inline_bytes, Fp128,
     InstructionReadRafStage1Lease, MetalError, PipelineLimits, SolinasMetal,
 };
+use crate::optimized::registers_read_write::{
+    AlignedPackedRegisterRows, PackedRegisterCycleRow, PACKED_REGISTER_ROWS_ALIGNMENT,
+};
 
 mod stage1;
 
@@ -32,6 +37,7 @@ const ADDRESS_BITS: usize = 7;
 const ABSENT_REGISTER: u8 = u8::MAX;
 const SOURCE_MATERIALIZED: u32 = 0;
 const SOURCE_INSTRUCTION_ROWS: u32 = 1;
+const SOURCE_PACKED_ROWS: u32 = 2;
 const MESSAGE_PIPELINE: &str = "solinas_registers_val_first_message_factorized";
 const NATIVE_TRANSITION_PIPELINE: &str = "solinas_registers_val_native_transition";
 const DENSE_TRANSITION_PIPELINE: &str = "solinas_registers_val_dense_transition";
@@ -83,6 +89,8 @@ struct MessageParams {
     high_blocks: u32,
     lt_lo_length: u32,
     source_layout: u32,
+    source_rows: u32,
+    _reserved: [u32; 3],
 }
 
 #[repr(C)]
@@ -121,6 +129,10 @@ enum RegistersValFirstMessageSource<'a> {
         receipt: Box<RegistersValInstructionSourceReceipt>,
         source: InstructionReadRafStage1Lease,
     },
+    PackedRows {
+        rows: Arc<AlignedPackedRegisterRows>,
+        cycles: usize,
+    },
 }
 
 impl RegistersValFirstMessageSource<'_> {
@@ -128,12 +140,20 @@ impl RegistersValFirstMessageSource<'_> {
         match self {
             Self::Uploaded { inc, .. } => inc.len(),
             Self::InstructionRows { receipt, .. } => receipt.cycles(),
+            Self::PackedRows { cycles, .. } => *cycles,
+        }
+    }
+
+    fn source_rows(&self) -> usize {
+        match self {
+            Self::PackedRows { rows, .. } => rows.device_view().rows(),
+            _ => self.cycles(),
         }
     }
 
     fn resident_receipt(&self) -> Option<RegistersValInstructionSourceReceipt> {
         match self {
-            Self::Uploaded { .. } => None,
+            Self::Uploaded { .. } | Self::PackedRows { .. } => None,
             Self::InstructionRows { receipt, .. } => Some(**receipt),
         }
     }
@@ -158,6 +178,7 @@ pub struct RegistersValFirstMessageInvocation {
     final_in_a: bool,
     resident_source: Option<RegistersValInstructionSourceReceipt>,
     instruction_source: Option<InstructionReadRafStage1Lease>,
+    packed_source: Option<Arc<AlignedPackedRegisterRows>>,
     completed: Cell<bool>,
 }
 
@@ -236,6 +257,7 @@ pub struct RegistersValFirstTransitionInvocation {
     threads_per_threadgroup: usize,
     final_in_a: bool,
     instruction_source: Option<InstructionReadRafStage1Lease>,
+    packed_source: Option<Arc<AlignedPackedRegisterRows>>,
     completed: Cell<bool>,
 }
 
@@ -329,6 +351,22 @@ impl SolinasMetal {
         )
     }
 
+    pub(crate) fn prepare_registers_val_first_message_packed_rows(
+        &self,
+        rows: Arc<AlignedPackedRegisterRows>,
+        cycles: usize,
+        r_address: &[AkitaField],
+        r_cycle: &[AkitaField],
+        config: RegistersValFirstMessageConfig,
+    ) -> Result<RegistersValFirstMessageInvocation, MetalError> {
+        self.prepare_registers_val_first_message_from_source(
+            RegistersValFirstMessageSource::PackedRows { rows, cycles },
+            r_address,
+            r_cycle,
+            config,
+        )
+    }
+
     fn prepare_registers_val_first_message_from_source(
         &self,
         source: RegistersValFirstMessageSource<'_>,
@@ -375,6 +413,32 @@ impl SolinasMetal {
                         "instruction-row source does not match its sealed receipt",
                     ));
                 }
+            }
+            RegistersValFirstMessageSource::PackedRows { rows, .. } => {
+                let view = rows.device_view();
+                let logical_bytes = view
+                    .rows()
+                    .checked_mul(size_of::<PackedRegisterCycleRow>())
+                    .ok_or(MetalError::InputTooLong(view.rows()))?;
+                if view.rows() == 0
+                    || view.rows() > cycles
+                    || !view
+                        .as_ptr()
+                        .addr()
+                        .is_multiple_of(PACKED_REGISTER_ROWS_ALIGNMENT)
+                    || !view
+                        .allocation_bytes()
+                        .is_multiple_of(PACKED_REGISTER_ROWS_ALIGNMENT)
+                    || view.allocation_bytes() < logical_bytes
+                {
+                    return Err(MetalError::InvalidRegistersValState(
+                        "packed register source does not satisfy the value-check contract",
+                    ));
+                }
+                self.validate_buffer_length(
+                    u64::try_from(view.allocation_bytes())
+                        .map_err(|_| MetalError::InputTooLong(view.rows()))?,
+                )?;
             }
         }
 
@@ -461,7 +525,8 @@ impl SolinasMetal {
             .ok_or(MetalError::InputTooLong(partial_count))?;
         let source_allocation_bytes = match &source {
             RegistersValFirstMessageSource::Uploaded { .. } => inc_bytes + rd_bytes,
-            RegistersValFirstMessageSource::InstructionRows { .. } => 0,
+            RegistersValFirstMessageSource::InstructionRows { .. }
+            | RegistersValFirstMessageSource::PackedRows { .. } => 0,
         };
         let additional_bytes = new_buffer_bytes
             .into_iter()
@@ -479,7 +544,11 @@ impl SolinasMetal {
             source_layout: match &source {
                 RegistersValFirstMessageSource::InstructionRows { .. } => SOURCE_INSTRUCTION_ROWS,
                 RegistersValFirstMessageSource::Uploaded { .. } => SOURCE_MATERIALIZED,
+                RegistersValFirstMessageSource::PackedRows { .. } => SOURCE_PACKED_ROWS,
             },
+            source_rows: u32::try_from(source.source_rows())
+                .map_err(|_| MetalError::InputTooLong(source.source_rows()))?,
+            _reserved: [0; 3],
         };
         let partial_a = self.new_registers_val_buffer(partial_elements)?;
         let partial_b = self.new_registers_val_buffer(partial_elements)?;
@@ -508,15 +577,27 @@ impl SolinasMetal {
         }
 
         let resident_source = source.resident_receipt();
-        let (inc, rd, instruction_source) = match source {
+        let (inc, rd, instruction_source, packed_source) = match source {
             RegistersValFirstMessageSource::Uploaded { inc, rd } => (
                 buffer_from_slice(&self.device, inc),
                 buffer_from_slice(&self.device, rd),
                 None,
+                None,
             ),
             RegistersValFirstMessageSource::InstructionRows { source, .. } => {
                 let rows = source.row_buffer().to_owned();
-                (rows.clone(), rows, Some(source))
+                (rows.clone(), rows, Some(source), None)
+            }
+            RegistersValFirstMessageSource::PackedRows { rows, .. } => {
+                let view = rows.device_view();
+                let buffer = self.device.new_buffer_with_bytes_no_copy(
+                    view.as_ptr().cast_mut().cast::<c_void>(),
+                    u64::try_from(view.allocation_bytes())
+                        .map_err(|_| MetalError::InputTooLong(view.rows()))?,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                );
+                (buffer.clone(), buffer, None, Some(rows))
             }
         };
         Ok(RegistersValFirstMessageInvocation {
@@ -549,6 +630,7 @@ impl SolinasMetal {
             final_in_a: input_a,
             resident_source,
             instruction_source,
+            packed_source,
             completed: Cell::new(false),
         })
     }
@@ -597,6 +679,8 @@ impl RegistersValFirstMessageInvocation {
             lt_lo_length: u32::try_from(bound_lt_lo.len())
                 .map_err(|_| MetalError::InputTooLong(bound_lt_lo.len()))?,
             source_layout: self.params.source_layout,
+            source_rows: self.params.source_rows,
+            _reserved: [0; 3],
         };
         let Buffers {
             inc,
@@ -638,6 +722,7 @@ impl RegistersValFirstMessageInvocation {
             threads_per_threadgroup,
             final_in_a: self.final_in_a,
             instruction_source: self.instruction_source,
+            packed_source: self.packed_source,
             completed: Cell::new(false),
         })
     }
@@ -769,8 +854,8 @@ impl RegistersValFirstTransitionInvocation {
         let current_elements = self.current_elements();
         drop(self.instruction_source);
         let TransitionBuffers {
-            inc: _,
-            rd: _,
+            inc,
+            rd,
             eq_address: _,
             lt_lo,
             lt_hi,
@@ -780,6 +865,9 @@ impl RegistersValFirstTransitionInvocation {
             partial_a,
             partial_b,
         } = self.buffers;
+        drop(inc);
+        drop(rd);
+        drop(self.packed_source);
         let current_lt_lo_length = self.params.lt_lo_length as usize;
         Ok(RegistersValSequence {
             context: self.context,
@@ -1002,6 +1090,9 @@ impl RegistersValSequence {
             lt_lo_length: u32::try_from(expected_lt_lo_length)
                 .map_err(|_| MetalError::InputTooLong(expected_lt_lo_length))?,
             source_layout: SOURCE_MATERIALIZED,
+            source_rows: u32::try_from(next_elements)
+                .map_err(|_| MetalError::InputTooLong(next_elements))?,
+            _reserved: [0; 3],
         };
 
         let (message, active_time) = autoreleasepool(|| {
@@ -1187,14 +1278,24 @@ fn write_registers_val_fields(
     Ok(())
 }
 
-const _: () = assert!(size_of::<MessageParams>() == 16);
+const _: () = assert!(size_of::<MessageParams>() == 32);
 const _: () = assert!(size_of::<ReductionParams>() == 16);
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "Metal parity setup")]
 mod tests {
-    use jolt_field::{Ring as _, Zero as _};
+    use jolt_claims::protocols::jolt::JoltOneHotConfig;
+    use jolt_field::{Field as _, Ring as _, Zero as _};
     use jolt_poly::{BindingOrder, Polynomial};
+    use jolt_program::execution::{
+        JoltProgram, OwnedTrace, RamAccess, RegisterState, RegisterWrite, TraceOutput, TraceRow,
+    };
+    use jolt_program::preprocess::{
+        BytecodePreprocessing, JoltProgramPreprocessing, RAMPreprocessing,
+    };
+    use jolt_riscv::{JoltInstructionKind, JoltInstructionRow, NormalizedOperands, RV64IMAC_JOLT};
+    use jolt_witness::{JoltVmWitnessConfig, JoltVmWitnessInputs, RowSource as _, TraceBackend};
+    use rand_core::SeedableRng as _;
 
     use super::*;
 
@@ -1208,6 +1309,239 @@ mod tests {
         let mut values = Polynomial::new(values);
         values.bind_with_order(challenge, BindingOrder::LowToHigh);
         values.evals().to_vec()
+    }
+
+    fn packed_fixture(log_t: usize) -> Arc<AlignedPackedRegisterRows> {
+        let writes = [
+            (Some(127), 0, u64::MAX),
+            (Some(127), u64::MAX, 0),
+            (None, 0, 0),
+            (Some(96), 0, 17),
+            (Some(96), 17, 1),
+            (Some(64), 0, u64::MAX),
+            (Some(64), u64::MAX, 0),
+            (Some(63), 0, 5),
+            (Some(63), 5, 0),
+            (None, 0, 0),
+            (Some(0), 0, 0),
+            (None, 0, 0),
+            (Some(127), 0, 7),
+        ];
+        let rows = writes
+            .into_iter()
+            .enumerate()
+            .map(|(cycle, (register, pre_value, post_value))| {
+                let instruction = JoltInstructionRow {
+                    instruction_kind: JoltInstructionKind::ADDI,
+                    address: 0x8000_0000 + 4 * cycle,
+                    operands: NormalizedOperands {
+                        rd: register,
+                        rs1: None,
+                        rs2: None,
+                        imm: 3,
+                    },
+                    virtual_sequence_remaining: None,
+                    is_first_in_sequence: false,
+                    is_compressed: false,
+                };
+                TraceRow::new(
+                    instruction,
+                    RegisterState {
+                        rd: register.map(|register| RegisterWrite {
+                            register,
+                            pre_value,
+                            post_value,
+                        }),
+                        ..Default::default()
+                    },
+                    RamAccess::NoOp,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let bytecode = rows.iter().map(|row| row.instruction()).collect();
+        let preprocessing = Arc::new(JoltProgramPreprocessing {
+            bytecode: BytecodePreprocessing::preprocess(bytecode, 0x8000_0000, RV64IMAC_JOLT)
+                .unwrap(),
+            ram: RAMPreprocessing::default(),
+            memory_layout: Default::default(),
+            max_padded_trace_length: 1 << log_t,
+        });
+        let program = Arc::new(JoltProgram::default());
+        let config = JoltVmWitnessConfig::new(
+            log_t,
+            64,
+            JoltOneHotConfig {
+                log_k_chunk: 4,
+                lookups_ra_virtual_log_k_chunk: 16,
+            },
+        );
+        let inputs = JoltVmWitnessInputs::new(
+            &program,
+            &preprocessing,
+            TraceOutput::new(OwnedTrace::new(rows), Default::default(), None, None),
+        );
+        let witness = TraceBackend::new(config, inputs);
+        let access = witness.random_access().unwrap();
+        Arc::new(
+            AlignedPackedRegisterRows::collect(&access, access.physical_rows(), false).unwrap(),
+        )
+    }
+
+    #[test]
+    fn packed_source_matches_materialized_first_native_and_dense_messages() {
+        for log_t in [6, 9, 10] {
+            let cycles = 1usize << log_t;
+            let rows = packed_fixture(log_t);
+            assert!(rows.device_view().remaps_registers());
+            let mut inc = vec![AkitaField::zero(); cycles];
+            let mut rd = vec![ABSENT_REGISTER; cycles];
+            for (index, row) in rows.as_slice().iter().enumerate() {
+                if row.rd_index != ABSENT_REGISTER {
+                    inc[index] = AkitaField::from_u64(row.rd_post_value)
+                        - AkitaField::from_u64(row.rd_pre_value);
+                    rd[index] = row.rd_index;
+                }
+            }
+            assert_eq!(inc[0], AkitaField::from_u64(u64::MAX));
+            assert_eq!(inc[1], -AkitaField::from_u64(u64::MAX));
+            let mut random = rand_chacha::ChaCha8Rng::seed_from_u64(0x4500 + log_t as u64);
+            let r_address = (0..ADDRESS_BITS)
+                .map(|_| AkitaField::random(&mut random))
+                .collect::<Vec<_>>();
+            let r_cycle = (0..log_t)
+                .map(|_| AkitaField::random(&mut random))
+                .collect::<Vec<_>>();
+            let context = SolinasMetal::for_akita().unwrap();
+            let baseline = context
+                .prepare_registers_val_first_message(
+                    &inc,
+                    &rd,
+                    &r_address,
+                    &r_cycle,
+                    RegistersValFirstMessageConfig::default(),
+                )
+                .unwrap();
+            let source_lifetime = Arc::downgrade(&rows);
+            let direct = context
+                .prepare_registers_val_first_message_packed_rows(
+                    rows,
+                    cycles,
+                    &r_address,
+                    &r_cycle,
+                    RegistersValFirstMessageConfig::default(),
+                )
+                .unwrap();
+            assert!(source_lifetime.upgrade().is_some());
+            baseline.execute().unwrap();
+            direct.execute().unwrap();
+            assert_eq!(
+                direct.read_message().unwrap(),
+                baseline.read_message().unwrap()
+            );
+
+            let r_lo = &r_cycle[r_cycle.len() - r_cycle.len() / 2..];
+            let challenge_0 = AkitaField::random(&mut random);
+            let challenge_1 = AkitaField::random(&mut random);
+            let lt_lo = bind(LtPolynomial::evaluations(r_lo), challenge_0);
+            let baseline = baseline
+                .into_first_transition(&lt_lo, RegistersValTransitionConfig::default())
+                .unwrap();
+            let direct = direct
+                .into_first_transition(&lt_lo, RegistersValTransitionConfig::default())
+                .unwrap();
+            assert!(source_lifetime.upgrade().is_some());
+            baseline.execute(challenge_0).unwrap();
+            direct.execute(challenge_0).unwrap();
+            assert_eq!(
+                direct.read_message().unwrap(),
+                baseline.read_message().unwrap()
+            );
+            let mut baseline_state = vec![[AkitaField::zero(); 2]; baseline.current_elements()];
+            let mut direct_state = vec![[AkitaField::zero(); 2]; direct.current_elements()];
+            baseline.read_dense_state_into(&mut baseline_state).unwrap();
+            direct.read_dense_state_into(&mut direct_state).unwrap();
+            assert_eq!(direct_state, baseline_state);
+
+            let mut baseline = baseline
+                .into_sequence(RegistersValDenseConfig::default())
+                .unwrap();
+            let mut direct = direct
+                .into_sequence(RegistersValDenseConfig::default())
+                .unwrap();
+            assert!(source_lifetime.upgrade().is_none());
+            let lt_lo = bind(lt_lo, challenge_1);
+            assert_eq!(
+                direct.bind_and_message(challenge_1, &lt_lo).unwrap(),
+                baseline.bind_and_message(challenge_1, &lt_lo).unwrap()
+            );
+            let mut baseline_state = vec![[AkitaField::zero(); 2]; baseline.current_elements()];
+            let mut direct_state = vec![[AkitaField::zero(); 2]; direct.current_elements()];
+            baseline
+                .read_current_dense_state_into(&mut baseline_state)
+                .unwrap();
+            direct
+                .read_current_dense_state_into(&mut direct_state)
+                .unwrap();
+            assert_eq!(direct_state, baseline_state);
+            let expected_inc = bind(bind(inc, challenge_0), challenge_1);
+            let eq_address = EqPolynomial::evals(&r_address, None);
+            let wa = rd
+                .iter()
+                .map(|&register| {
+                    if register == ABSENT_REGISTER {
+                        AkitaField::zero()
+                    } else {
+                        eq_address[usize::from(register)]
+                    }
+                })
+                .collect::<Vec<_>>();
+            let expected_wa = bind(bind(wa, challenge_0), challenge_1);
+            let expected = expected_inc
+                .into_iter()
+                .zip(expected_wa)
+                .map(|(inc, wa)| [inc, wa])
+                .collect::<Vec<_>>();
+            assert_eq!(direct_state, expected);
+        }
+    }
+
+    #[test]
+    fn packed_source_rejects_invalid_domain_and_point_shape() {
+        let rows = packed_fixture(6);
+        let context = SolinasMetal::for_akita().unwrap();
+        let r_address = point(ADDRESS_BITS, 101);
+        let r_cycle = point(6, 211);
+        assert!(matches!(
+            context.prepare_registers_val_first_message_packed_rows(
+                Arc::clone(&rows),
+                8,
+                &r_address,
+                &r_cycle[..3],
+                RegistersValFirstMessageConfig::default(),
+            ),
+            Err(MetalError::InvalidRegistersValState(_))
+        ));
+        assert!(matches!(
+            context.prepare_registers_val_first_message_packed_rows(
+                Arc::clone(&rows),
+                64,
+                &r_address[..6],
+                &r_cycle,
+                RegistersValFirstMessageConfig::default(),
+            ),
+            Err(MetalError::RegistersValPointShape { .. })
+        ));
+        assert!(matches!(
+            context.prepare_registers_val_first_message_packed_rows(
+                rows,
+                64,
+                &r_address,
+                &r_cycle[..5],
+                RegistersValFirstMessageConfig::default(),
+            ),
+            Err(MetalError::RegistersValPointShape { .. })
+        ));
     }
 
     #[test]

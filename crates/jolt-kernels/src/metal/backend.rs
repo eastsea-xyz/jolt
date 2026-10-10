@@ -121,7 +121,7 @@ impl MetalConfig {
         config.instruction_input.dense_storage_mode =
             InstructionInputDenseStorageMode::OuterResidual;
         config.registers_val_evaluation.source = RegistersValEvaluationSource::Stage1Resident;
-        config.registers_val_evaluation.trace_cutoff_elements = 1 << 26;
+        config.registers_val_evaluation.trace_cutoff_elements = 1 << 22;
         config.ram_read_write.gpu_record_scatter_cutoff_elements = 1 << 29;
         config
     }
@@ -245,14 +245,14 @@ impl MetalBackend {
         }
         if config.registers_val_evaluation.source == RegistersValEvaluationSource::Stage1Resident
             && (config.instruction_read_raf.address_cutoff_elements
-                > config.registers_val_evaluation.trace_cutoff_elements
-                || !(1 << 26..=1 << 28)
+                > config.registers_val_evaluation.trace_cutoff_elements.max(1 << 26)
+                || !(1 << 22..=1 << 28)
                     .contains(&config.registers_val_evaluation.trace_cutoff_elements)
                 || config.registers_val_evaluation.cutoff_elements
                     >= config.registers_val_evaluation.trace_cutoff_elements)
         {
             return Err(MetalError::InvalidRegistersValState(
-                "Stage-1 resident RegistersVal requires the grouped owner at logs 26 through 28 and a smaller tail cutoff",
+                "RegistersVal requires the grouped owner at resident logs 26 through 28 and a smaller tail cutoff; native shapes use packed rows or upload",
             ));
         }
         if config.instruction_input.dense_storage_mode
@@ -426,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             config.registers_val_evaluation.trace_cutoff_elements,
-            1 << 26
+            1 << 22
         );
         assert_eq!(config.instruction_read_raf.address_cutoff_elements, 1 << 24);
         assert_eq!(config.registers_read_write.trace_cutoff_elements, 1 << 22);
@@ -465,6 +465,20 @@ mod tests {
     fn production_profile_compiles_its_minimal_metal_library() {
         let result = MetalBackend::production();
         assert!(result.is_ok(), "{:#?}", result.err());
+    }
+
+    #[test]
+    fn resident_registers_val_allows_native_upload_before_resident_shapes() {
+        let mut config = MetalConfig::production();
+        config.registers_val_evaluation.trace_cutoff_elements = 1 << 22;
+        assert!(MetalBackend::validate_config(&config).is_ok());
+
+        config.instruction_read_raf.address_cutoff_elements = 1 << 27;
+        config.bytecode_read_raf_address.trace_cutoff_elements = 1 << 27;
+        assert!(matches!(
+            MetalBackend::validate_config(&config),
+            Err(MetalError::InvalidRegistersValState(_))
+        ));
     }
 
     #[test]

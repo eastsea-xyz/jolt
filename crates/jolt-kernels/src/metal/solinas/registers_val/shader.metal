@@ -5,9 +5,14 @@ struct RegistersValMessageParams {
     uint high_blocks;
     uint lt_lo_length;
     uint source_layout;
+    uint source_rows;
+    uint reserved_0;
+    uint reserved_1;
+    uint reserved_2;
 };
 
 #define REGISTERS_VAL_SOURCE_INSTRUCTION_ROWS 1u
+#define REGISTERS_VAL_SOURCE_PACKED_ROWS 2u
 
 struct RegistersValReductionParams {
     uint input_count;
@@ -27,8 +32,23 @@ inline SolinasFp128 registers_val_inc(
     device const uchar* source_values,
     uint source_layout,
     uint cycles,
+    uint source_rows,
     uint index)
 {
+    if (source_layout == REGISTERS_VAL_SOURCE_PACKED_ROWS) {
+        if (index >= source_rows) {
+            return solinas_zero();
+        }
+        device const PackedRegisterCycleRow* rows =
+            (device const PackedRegisterCycleRow*)source_values;
+        PackedRegisterCycleRow row = rows[index];
+        if (row.rd_index == 255u) {
+            return solinas_zero();
+        }
+        return solinas_sub(
+            registers_val_from_u64(row.rd_post_value),
+            registers_val_from_u64(row.rd_pre_value));
+    }
     if (source_layout == REGISTERS_VAL_SOURCE_INSTRUCTION_ROWS) {
         device const ulong* rows = (device const ulong*)source_values;
         ulong metadata = booleanity_source_word(rows, cycles, 3u, index);
@@ -50,8 +70,17 @@ inline uchar registers_val_rd(
     device const uchar* source_indices,
     uint source_layout,
     uint cycles,
+    uint source_rows,
     uint index)
 {
+    if (source_layout == REGISTERS_VAL_SOURCE_PACKED_ROWS) {
+        if (index >= source_rows) {
+            return uchar(255u);
+        }
+        device const PackedRegisterCycleRow* rows =
+            (device const PackedRegisterCycleRow*)source_values;
+        return rows[index].rd_index;
+    }
     if (source_layout == REGISTERS_VAL_SOURCE_INSTRUCTION_ROWS) {
         device const ulong* rows = (device const ulong*)source_values;
         ulong metadata = booleanity_source_word(rows, cycles, 3u, index);
@@ -67,10 +96,11 @@ inline SolinasFp128 registers_val_wa(
     device const SolinasFp128* eq_address,
     uint source_layout,
     uint cycles,
+    uint source_rows,
     uint index)
 {
     uchar index_value = registers_val_rd(
-        source_values, source_indices, source_layout, cycles, index);
+        source_values, source_indices, source_layout, cycles, source_rows, index);
     return index_value == 255u
         ? solinas_zero()
         : eq_address[(uint)index_value];
@@ -197,9 +227,9 @@ kernel void solinas_registers_val_first_message_factorized(
         uint index_0 = high_base + low_0;
         uint index_1 = index_0 + 1u;
         SolinasFp128 inc_0 = registers_val_inc(
-            source_values, params.source_layout, params.cycles, index_0);
+            source_values, params.source_layout, params.cycles, params.source_rows, index_0);
         SolinasFp128 inc_1 = registers_val_inc(
-            source_values, params.source_layout, params.cycles, index_1);
+            source_values, params.source_layout, params.cycles, params.source_rows, index_1);
         SolinasFp128 inc_delta = solinas_sub(inc_1, inc_0);
         SolinasFp128 wa_0 = registers_val_wa(
             source_values,
@@ -207,6 +237,7 @@ kernel void solinas_registers_val_first_message_factorized(
             eq_address,
             params.source_layout,
             params.cycles,
+            params.source_rows,
             index_0);
         SolinasFp128 wa_delta = solinas_sub(
             registers_val_wa(
@@ -215,6 +246,7 @@ kernel void solinas_registers_val_first_message_factorized(
                 eq_address,
                 params.source_layout,
                 params.cycles,
+                params.source_rows,
                 index_1),
             wa_0);
         SolinasFp128 lt_0 = lt_lo[low_0];
@@ -315,9 +347,9 @@ kernel void solinas_registers_val_native_transition(
         RegistersValDenseRow low;
         low.inc = registers_val_bind(
             registers_val_inc(
-                source_values, params.source_layout, params.cycles, source),
+                source_values, params.source_layout, params.cycles, params.source_rows, source),
             registers_val_inc(
-                source_values, params.source_layout, params.cycles, source + 1u),
+                source_values, params.source_layout, params.cycles, params.source_rows, source + 1u),
             challenge);
         low.wa = registers_val_bind(
             registers_val_wa(
@@ -326,6 +358,7 @@ kernel void solinas_registers_val_native_transition(
                 eq_address,
                 params.source_layout,
                 params.cycles,
+                params.source_rows,
                 source),
             registers_val_wa(
                 source_values,
@@ -333,14 +366,15 @@ kernel void solinas_registers_val_native_transition(
                 eq_address,
                 params.source_layout,
                 params.cycles,
+                params.source_rows,
                 source + 1u),
             challenge);
         RegistersValDenseRow high_value;
         high_value.inc = registers_val_bind(
             registers_val_inc(
-                source_values, params.source_layout, params.cycles, source + 2u),
+                source_values, params.source_layout, params.cycles, params.source_rows, source + 2u),
             registers_val_inc(
-                source_values, params.source_layout, params.cycles, source + 3u),
+                source_values, params.source_layout, params.cycles, params.source_rows, source + 3u),
             challenge);
         high_value.wa = registers_val_bind(
             registers_val_wa(
@@ -349,6 +383,7 @@ kernel void solinas_registers_val_native_transition(
                 eq_address,
                 params.source_layout,
                 params.cycles,
+                params.source_rows,
                 source + 2u),
             registers_val_wa(
                 source_values,
@@ -356,6 +391,7 @@ kernel void solinas_registers_val_native_transition(
                 eq_address,
                 params.source_layout,
                 params.cycles,
+                params.source_rows,
                 source + 3u),
             challenge);
         dense[destination] = low;

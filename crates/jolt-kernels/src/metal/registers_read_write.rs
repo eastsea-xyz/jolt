@@ -57,6 +57,30 @@ type RegistersReadWriteKernelBox =
 
 const METAL_OPERAND_CLAIMS_LOG_T_MIN: usize = 22;
 
+pub(crate) struct SharedPackedRegisterRows {
+    pub(crate) rows: Arc<AlignedPackedRegisterRows>,
+    pub(crate) cycles: usize,
+}
+
+#[cfg(feature = "allocative")]
+impl allocative::Allocative for SharedPackedRegisterRows {
+    fn visit<'a, 'b: 'a>(&self, visitor: &'a mut allocative::Visitor<'b>) {
+        let mut visitor = visitor.enter_self_sized::<Self>();
+        if let Some(mut shared) = visitor.enter_shared(
+            allocative::Key::new("packed_rows"),
+            std::mem::size_of::<Arc<AlignedPackedRegisterRows>>(),
+            Arc::as_ptr(&self.rows).cast(),
+        ) {
+            shared.visit_simple(
+                allocative::Key::new("allocation"),
+                self.rows.allocation_bytes(),
+            );
+            shared.exit();
+        }
+        visitor.exit();
+    }
+}
+
 struct MetalRegistersReadWriteKernel {
     sequence: Vec<RegistersReadWriteCycleSequence>,
     source_owner: Option<Arc<AlignedPackedRegisterRows>>,
@@ -554,7 +578,20 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
         } else {
             "direct_witness"
         };
-        if needs_rd_carry {
+        let value_config = self.config.registers_val_evaluation;
+        let value_split_handoff = cycles >> (log_t / 2).saturating_sub(1);
+        let packed_value_requested = log_t < 25
+            && cycles >= value_config.trace_cutoff_elements
+            && cycles > value_config.cutoff_elements.max(value_split_handoff)
+            && (value_config.source == RegistersValEvaluationSource::WitnessUpload
+                || (value_config.source == RegistersValEvaluationSource::Stage1Resident
+                    && log_t < 26));
+        if packed_value_requested {
+            session.park(SharedPackedRegisterRows {
+                rows: Arc::clone(&source_owner),
+                cycles,
+            });
+        } else if needs_rd_carry {
             #[cfg(feature = "parallel")]
             let mut rd_indices = source_owner
                 .as_slice()
