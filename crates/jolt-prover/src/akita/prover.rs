@@ -113,6 +113,7 @@ where
     });
     let stage0 = stage0?;
     witness_prepare?;
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let checked = stage0.checked;
     let mut transcript = stage0.transcript;
 
@@ -126,6 +127,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage2");
     let stage2 = prove_stage2::<F, PCS, VC, T>(
         &backend.base,
@@ -138,6 +140,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage3");
     let stage3 = prove_stage3::<F, PCS, VC, T>(
         &backend.base,
@@ -150,6 +153,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage4");
     let stage4 = prove_stage4::<F, PCS, VC, T>(
         &backend.base,
@@ -164,6 +168,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage5");
     let stage5 = prove_stage5::<F, PCS, VC, T>(
         &backend.base,
@@ -178,6 +183,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage6a");
     let stage6a = prove_stage6a::<F, PCS, VC, T>(
         &backend.base,
@@ -195,6 +201,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage6b");
     let stage6b = prove_stage6b::<F, PCS, VC, T>(
         &backend.base,
@@ -213,6 +220,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("sumcheck.stage7");
     let stage7 = prove_stage7::<F, PCS, VC, T>(
         &backend.base,
@@ -227,6 +235,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
     let profile = telemetry::stage("opening.stage8");
     let joint_opening_proof = prove_stage8::<F, PCS, VC, T>(
         &checked,
@@ -246,6 +255,7 @@ where
         &mut transcript,
     )?;
     drop(profile);
+    jolt_kernels::mem::purge_retained_memory(log_t);
 
     Ok(JoltProof {
         protocol: JoltProtocolConfig::for_zk(false),
