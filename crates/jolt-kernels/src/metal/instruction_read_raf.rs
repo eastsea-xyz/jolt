@@ -587,9 +587,21 @@ impl PrepareKernel<AkitaField, InstructionReadRaf<AkitaField>> for MetalBackend 
             || trace_elements >= self.config.booleanity_cycle.trace_cutoff_elements
             || trace_elements >= self.config.bytecode_read_raf_cycle.trace_cutoff_elements
             || hamming_rows_requested;
+        // Native Product9 keeps the CPU source preparation above. Its unused
+        // Stage-1 owner can still supply the exact resident rows without a
+        // second upload; existing consumer leases keep their own source alive.
+        let native_rows_owner = (use_metal_address
+            && native_product9_shape(trace_elements, virtual_ra_polys)
+            && resident_rows_requested)
+            .then(|| session.take::<InstructionReadRafStage1Owner>())
+            .flatten();
         if resident_rows_requested && session.state::<BooleanityRows>().is_none() {
-            let prepared_rows = if let Some(owner) = stage1_owner.as_ref() {
-                let receipt = owner.receipt();
+            let row_owner = stage1_owner.as_ref().or(native_rows_owner.as_ref());
+            let prepared_rows = if let Some(owner) = row_owner {
+                let receipt = owner
+                    .lease(trace_elements, self.context.device_registry_id())
+                    .map_err(metal_prepare_error)?
+                    .receipt();
                 Ok((
                     owner.booleanity_rows(),
                     0u64,
@@ -644,6 +656,9 @@ impl PrepareKernel<AkitaField, InstructionReadRaf<AkitaField>> for MetalBackend 
                 Err(error) => return Err(backend_error(error.to_string()).into()),
             }
         }
+        // BooleanityRows owns the shared allocation independently. Release
+        // unused native claims/counts before allocating the address sequence.
+        drop(native_rows_owner);
         Ok(Box::new(MetalInstructionReadRafKernel::new(
             cpu,
             Arc::clone(&self.context),
@@ -1132,15 +1147,18 @@ mod tests {
     use std::{num::NonZeroUsize, sync::Arc};
 
     use jolt_claims::protocols::jolt::geometry::instruction::InstructionReadRafDimensions;
-    use jolt_claims::protocols::jolt::relations::instruction::InstructionReadRafInputClaims;
+    use jolt_claims::protocols::jolt::relations::instruction::{
+        InstructionReadRafInputClaims, InstructionReadRafOutputClaims,
+    };
     use jolt_claims::protocols::jolt::{JoltPolynomialId, JoltVirtualPolynomial};
-    use jolt_field::{Field as _, Ring as _};
-    use jolt_poly::Polynomial;
+    use jolt_field::{CanonicalBytes as _, Field as _, Ring as _};
+    use jolt_poly::{Polynomial, UnivariatePoly};
     use jolt_verifier::stages::stage5::instruction_read_raf::InstructionReadRafChallenges;
     use jolt_witness::testing::with_sample_backend_at_log_t;
     use rand_core::SeedableRng as _;
 
     use super::*;
+    use crate::metal::solinas::Product9ResidentSource;
 
     #[test]
     #[expect(
@@ -1237,6 +1255,239 @@ mod tests {
                 expected.output_claims(&claims).unwrap()
             );
             assert_eq!(actual.execution_domain(), RoundExecutionDomain::Host);
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "native T22 allocation identity and source lifetime regression"
+    )]
+    fn native_product9_reuses_stage1_booleanity_rows() {
+        let log_t = 22;
+        let cycles = 1 << log_t;
+        let dimensions =
+            InstructionReadRafDimensions::new(log_t, 128, NonZeroUsize::new(8).unwrap());
+        assert!(native_product9_shape(cycles, 8));
+        with_sample_backend_at_log_t(log_t, 8, |witness| {
+            let metal = MetalBackend::new(Default::default()).unwrap();
+            // The existing witness has two physical rows and pads the native
+            // T22 domain. Drop the unrelated Outer allocations before Stage 5.
+            let (outer_rows, ready) =
+                crate::optimized::spartan_outer::prepare_metal_spartan_outer_stage1_owner_witness_rows(
+                    &metal.context,
+                    witness,
+                    cycles,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            drop(outer_rows);
+            let source_receipt = ready.owner.receipt();
+            let source_rows = ready.owner.booleanity_rows();
+            let retained_consumer = ready
+                .owner
+                .lease(cycles, metal.context.device_registry_id())
+                .unwrap();
+            let mut session = ProofSession::default();
+            session.park(ready.owner);
+            let relation = InstructionReadRaf::new(dimensions);
+            let claims = InstructionReadRafInputClaims::<AkitaField>::default();
+            let point = (0..log_t)
+                .map(|index| AkitaField::from_u64(101 + 7 * index as u64))
+                .collect::<Vec<_>>();
+            let points = InstructionReadRafInputClaims {
+                lookup_output: point.clone(),
+                left_lookup_operand: point.clone(),
+                right_lookup_operand: point,
+            };
+            let challenges = InstructionReadRafChallenges {
+                gamma: AkitaField::from_u64(317),
+            };
+            let kernel = metal
+                .prepare(
+                    &mut session,
+                    witness,
+                    ProverInputs {
+                        relation: &relation,
+                        claims: &claims,
+                        points: &points,
+                        challenges: &challenges,
+                    },
+                )
+                .unwrap();
+            let resident = session.state::<BooleanityRows>().unwrap();
+            assert!(
+                resident.shares_allocation(&source_rows),
+                "native Stage 5 must reuse its Stage-1 row allocation"
+            );
+            assert_eq!(
+                resident.allocation_identity(),
+                source_receipt.row_allocation_identity()
+            );
+            assert_eq!(resident.len(), source_receipt.rows());
+            assert_eq!(resident.buffer().length(), source_receipt.row_bytes());
+            assert_eq!(
+                resident.device_registry_id(),
+                source_receipt.device_registry_id()
+            );
+            assert!(source_receipt.source_generation() != 0);
+            assert!(source_receipt.completion_serial() != 0);
+            assert!(
+                session.state::<InstructionReadRafStage1Owner>().is_none(),
+                "unused native claims/counts must not be parked until proof end"
+            );
+            // Consuming the session owner must not invalidate independent
+            // consumers. Their final lease drop leaves the row-only carry.
+            assert_eq!(retained_consumer.receipt(), source_receipt);
+            assert_eq!(retained_consumer.claim_slice().len(), cycles);
+            drop(retained_consumer);
+            assert!(session
+                .state::<BooleanityRows>()
+                .unwrap()
+                .shares_allocation(&source_rows));
+            assert_eq!(kernel.execution_domain(), RoundExecutionDomain::Accelerator);
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "independent witness/reference oracle for the native Product9 algebra"
+    )]
+    fn product9_witness_round_and_claim_bytes_match_reference() {
+        let log_t = 9;
+        let dimensions =
+            InstructionReadRafDimensions::new(log_t, 128, NonZeroUsize::new(8).unwrap());
+        with_sample_backend_at_log_t(log_t, 8, |witness| {
+            let mut random = rand_chacha::ChaCha8Rng::seed_from_u64(0x6b_45_09);
+            let point = (0..log_t)
+                .map(|_| AkitaField::random(&mut random))
+                .collect::<Vec<_>>();
+            let gamma = AkitaField::from_u64(317);
+            let evaluate = |id| {
+                let table = jolt_witness::JoltWitnessOracle::<AkitaField>::oracle_table(
+                    witness,
+                    JoltPolynomialId::Virtual(id),
+                )
+                .unwrap();
+                Polynomial::new(table).evaluate(&point)
+            };
+            let claims = InstructionReadRafInputClaims {
+                lookup_output: evaluate(JoltVirtualPolynomial::LookupOutput),
+                left_lookup_operand: evaluate(JoltVirtualPolynomial::LeftLookupOperand),
+                right_lookup_operand: evaluate(JoltVirtualPolynomial::RightLookupOperand),
+            };
+            let points = InstructionReadRafInputClaims {
+                lookup_output: point.clone(),
+                left_lookup_operand: point.clone(),
+                right_lookup_operand: point,
+            };
+            let challenges = InstructionReadRafChallenges { gamma };
+            let relation = InstructionReadRaf::new(dimensions);
+            let inputs = || ProverInputs {
+                relation: &relation,
+                claims: &claims,
+                points: &points,
+                challenges: &challenges,
+            };
+            let mut expected = crate::ReferenceBackend
+                .prepare(&mut ProofSession::default(), witness, inputs())
+                .unwrap();
+            let mut actual = prepare_metal_instruction_read_raf(
+                &mut ProofSession::default(),
+                witness,
+                inputs(),
+                false,
+            )
+            .unwrap();
+            let rows = jolt_witness::collect_bundles::<
+                crate::reference::instruction_read_raf::InstructionReadRafWitness,
+            >(witness, 1 << log_t)
+            .unwrap();
+            let lookups = rows
+                .iter()
+                .map(|row| row.lookup_index.0)
+                .collect::<Vec<_>>();
+            let selectors = rows
+                .iter()
+                .map(|row| {
+                    row.table_index.0.map_or(0, |table| table as u8 + 1)
+                        | if row.raf_flag.0 { 0x80 } else { 0 }
+                })
+                .collect::<Vec<_>>();
+            let binds = (0..expected.num_rounds())
+                .map(|round| match round {
+                    1 | 130 => AkitaField::zero(),
+                    2 | 131 => AkitaField::from_u64(1),
+                    _ => AkitaField::random(&mut random),
+                })
+                .collect::<Vec<_>>();
+            let mut claim = claims.lookup_output
+                + gamma * claims.left_lookup_operand
+                + gamma * gamma * claims.right_lookup_operand;
+            let mut adapter = None;
+            let mut saw_gpu_cycle = false;
+            let mut saw_cpu_tail = false;
+            for round in 0..expected.num_rounds() {
+                let bind = round.checked_sub(1).map(|previous| binds[previous]);
+                let oracle = expected.prove_round(bind, round, claim).unwrap();
+                let polynomial = if round < 128 {
+                    actual.prove_round(bind, round, claim).unwrap()
+                } else {
+                    let mut cycle_bind = bind;
+                    if adapter.is_none() {
+                        // Only the final address bit is bound here. The first
+                        // Product9 cycle message has no prior cycle challenge.
+                        let _ = actual.prove_round(cycle_bind.take(), round, claim).unwrap();
+                        let context = SolinasMetal::for_akita().unwrap();
+                        let source =
+                            Product9ResidentSource::fixture(&context, &lookups, &selectors)
+                                .unwrap();
+                        adapter = Some(
+                            Product9CycleAdapter::prepare(&mut actual, context, source, 4).unwrap(),
+                        );
+                    }
+                    let adapter = adapter.as_mut().unwrap();
+                    saw_gpu_cycle |=
+                        adapter.execution_domain() == RoundExecutionDomain::Accelerator;
+                    let polynomial = adapter
+                        .prove_round(&mut actual, cycle_bind, round, claim)
+                        .unwrap();
+                    saw_cpu_tail |= adapter.execution_domain() == RoundExecutionDomain::Host;
+                    polynomial
+                };
+                let bytes = |polynomial: &UnivariatePoly<AkitaField>| {
+                    polynomial
+                        .coefficients()
+                        .iter()
+                        .flat_map(|coefficient| coefficient.to_bytes_le_vec())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bytes(&polynomial), bytes(&oracle), "round {round}");
+                claim = oracle.evaluate(binds[round]);
+            }
+            assert!(saw_gpu_cycle);
+            assert!(saw_cpu_tail);
+            adapter.as_mut().unwrap().restore(&mut actual).unwrap();
+            expected.finish_rounds(*binds.last().unwrap()).unwrap();
+            actual.finish_rounds(*binds.last().unwrap()).unwrap();
+            let expected_claims = expected.output_claims(&claims).unwrap();
+            let actual_claims = actual.output_claims(&claims).unwrap();
+            assert_eq!(actual_claims, expected_claims);
+            let bytes = |claims: &InstructionReadRafOutputClaims<AkitaField>| {
+                claims
+                    .lookup_table_flags
+                    .iter()
+                    .chain(&claims.instruction_ra)
+                    .chain(std::iter::once(&claims.instruction_raf_flag))
+                    .flat_map(|claim| claim.to_bytes_le_vec())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bytes(&actual_claims), bytes(&expected_claims));
         });
     }
 
