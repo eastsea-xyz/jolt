@@ -3,7 +3,7 @@ use std::sync::Arc;
 use jolt_claims::protocols::jolt::{JoltDerivedId, RamValCheckPublic};
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
 use jolt_poly::UnivariatePoly;
-use jolt_sumcheck::{ProveRounds, SumcheckError};
+use jolt_sumcheck::{ProveRounds, RoundExecutionDomain, SumcheckError};
 use jolt_verifier::stages::relations::{
     ConcreteSumcheck, ConcreteSumcheckChallenges, SumcheckInputClaims, SumcheckInputPoints,
     SumcheckOutputPoints,
@@ -37,7 +37,7 @@ pub struct RamValCheckMetalConfig {
 impl Default for RamValCheckMetalConfig {
     fn default() -> Self {
         Self {
-            trace_cutoff_elements: 1 << 25,
+            trace_cutoff_elements: 1 << 22,
         }
     }
 }
@@ -165,6 +165,14 @@ impl ProveRounds<AkitaField> for MetalRamValCheckKernel {
         self.rounds
     }
 
+    fn execution_domain(&self) -> RoundExecutionDomain {
+        if self.terminal.is_some() {
+            RoundExecutionDomain::Host
+        } else {
+            RoundExecutionDomain::Accelerator
+        }
+    }
+
     fn prove_round(
         &mut self,
         bind: Option<AkitaField>,
@@ -267,26 +275,17 @@ impl PrepareKernel<AkitaField, RamValCheck<AkitaField>> for MetalBackend {
         let columns = RamAccessColumns::shared(session, witness, log_t)?;
         columns.validate_addresses(1usize << relation.ram_log_k())?;
         if cycles >= self.config.ram_val_check.trace_cutoff_elements {
-            if let Some(sequence) = prepare_host_sparse_ram_val_check(
-                session,
-                witness,
-                relation,
-                &points.ram_val,
-                gamma,
-            )? {
-                let _ = session.take::<RamRafAddressPlane>();
-                let _ = session.take::<Arc<RamIncrementActivity>>();
-                #[cfg(any(test, feature = "test-utils"))]
-                let _ = self
-                    .test_counters
-                    .ram_val_sparse_sequences
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(Box::new(sequence));
-            }
-            if session
-                .state::<Arc<RamIncrementActivity>>()
-                .is_some_and(|activity| activity.len() != 0)
+            // Width-32 materialization consumes five low cycle variables.
+            if log_t >= 10
+                && session
+                    .state::<Arc<RamIncrementActivity>>()
+                    .is_some_and(|activity| activity.len() != 0)
             {
+                if points.ram_val.len() != relation.ram_log_k() + log_t {
+                    return Err(KernelError::InvariantViolation {
+                        reason: "RAM value-check input point has the wrong variable count",
+                    });
+                }
                 let activity = Arc::clone(session.state::<Arc<RamIncrementActivity>>().ok_or(
                     KernelError::InvariantViolation {
                         reason: "RAM value-check lost its sparse increment stream",
@@ -329,6 +328,22 @@ impl PrepareKernel<AkitaField, RamValCheck<AkitaField>> for MetalBackend {
                     next_round: 0,
                     terminal: None,
                 }));
+            }
+            if let Some(sequence) = prepare_host_sparse_ram_val_check(
+                session,
+                witness,
+                relation,
+                &points.ram_val,
+                gamma,
+            )? {
+                let _ = session.take::<RamRafAddressPlane>();
+                let _ = session.take::<Arc<RamIncrementActivity>>();
+                #[cfg(any(test, feature = "test-utils"))]
+                let _ = self
+                    .test_counters
+                    .ram_val_sparse_sequences
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(Box::new(sequence));
             }
         }
         Ok(Box::new(prepare_optimized_ram_val_check(
@@ -405,7 +420,9 @@ fn metal_error(message: impl Into<String>) -> SumcheckError<AkitaField> {
     reason = "Metal parity test setup"
 )]
 mod tests {
-    use jolt_field::{Ring as _, Zero as _};
+    use jolt_field::{Field as _, Ring as _, Zero as _};
+    use jolt_sumcheck::RoundExecutionDomain;
+    use rand_core::{RngCore as _, SeedableRng as _};
     use std::sync::Arc;
 
     use jolt_claims::protocols::jolt::geometry::dimensions::TraceDimensions;
@@ -434,6 +451,157 @@ mod tests {
         (0..len as u64)
             .map(|index| AkitaField::from_u64(seed + 37 * index + 5))
             .collect()
+    }
+
+    #[test]
+    fn production_dispatch_admits_t22_and_t24() {
+        let config = RamValCheckMetalConfig::default();
+        for log_t in [22, 24] {
+            assert!(
+                config.trace_cutoff_elements <= 1usize << log_t,
+                "the {log_t}-variable frozen fixture must enter the RAM value-check GPU route"
+            );
+        }
+    }
+
+    #[test]
+    fn production_device_sequence_matches_random_cpu_with_shared_owner() {
+        for (seed, log_t) in [(0x451u64, 10), (0x452, 12), (0x453, 15)] {
+            let shape = FixtureShape {
+                log_t,
+                ram_k: RAM_RAF_ADDRESS_DOMAIN,
+            };
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+            let mut ops = vec![
+                RamOp::Write {
+                    word: 7,
+                    post: u64::MAX,
+                },
+                RamOp::Write { word: 7, post: 0 },
+                RamOp::Read { word: 7 },
+                RamOp::None,
+            ];
+            ops.extend((0..384).map(|_| {
+                let word = 2 + rng.next_u64() % 126;
+                match rng.next_u64() % 4 {
+                    0 => RamOp::None,
+                    1 => RamOp::Read { word },
+                    _ => RamOp::Write {
+                        word,
+                        post: rng.next_u64(),
+                    },
+                }
+            }));
+            with_ram_fixture_backend(shape, ops, |witness| {
+                let relation = RamValCheck::<AkitaField>::new(
+                    TraceDimensions::new(shape.log_t),
+                    shape.log_k(),
+                    RamValCheckInit::full(AkitaField::zero()),
+                );
+                let claims = RamValCheckInputClaims {
+                    ram_val: AkitaField::zero(),
+                    ram_val_final: AkitaField::zero(),
+                    untrusted_advice: None,
+                    trusted_advice: None,
+                    program_image: None,
+                };
+                let points = RamValCheckInputClaims::<Vec<AkitaField>> {
+                    ram_val: (0..shape.log_k() + shape.log_t)
+                        .map(|_| AkitaField::random(&mut rng))
+                        .collect(),
+                    ram_val_final: (0..shape.log_k())
+                        .map(|_| AkitaField::random(&mut rng))
+                        .collect(),
+                    untrusted_advice: None,
+                    trusted_advice: None,
+                    program_image: None,
+                };
+                let challenges = RamValCheckChallenges {
+                    gamma: AkitaField::random(&mut rng),
+                };
+                let inputs = || ProverInputs {
+                    relation: &relation,
+                    claims: &claims,
+                    points: &points,
+                    challenges: &challenges,
+                };
+                let mut config = MetalConfig::default();
+                config.ram_val_check.trace_cutoff_elements = 1 << shape.log_t;
+                let metal = MetalBackend::new(config).unwrap();
+                let mut session = ProofSession::default();
+                let shared_owner = if log_t == 12 {
+                    None
+                } else {
+                    Some(
+                        shared_ram_cycle_family_owner(
+                            &mut session,
+                            witness,
+                            shape.log_t,
+                            shape.log_k(),
+                        )
+                        .unwrap()
+                        .expect("the production RAM sources publish a shared owner"),
+                    )
+                };
+                let mut actual =
+                    PrepareKernel::prepare(&metal, &mut session, witness, inputs()).unwrap();
+                assert_eq!(
+                    actual.execution_domain(),
+                    RoundExecutionDomain::Accelerator,
+                    "a shared RAM owner must not divert an admitted GPU member to host rounds"
+                );
+                assert!(session.state::<Arc<RamIncrementActivity>>().is_some());
+                if let Some(shared_owner) = shared_owner {
+                    assert!(Arc::ptr_eq(
+                        &shared_owner,
+                        session.state::<Arc<RamCycleFamilyOwner>>().unwrap()
+                    ));
+                } else {
+                    assert!(session.state::<Arc<RamCycleFamilyOwner>>().is_none());
+                    assert!(shared_ram_cycle_family_owner(
+                        &mut session,
+                        witness,
+                        shape.log_t,
+                        shape.log_k(),
+                    )
+                    .unwrap()
+                    .is_some());
+                }
+                let mut expected = OptimizedBackend
+                    .prepare(&mut ProofSession::default(), witness, inputs())
+                    .unwrap();
+                let (r_address, r_cycle) = points.ram_val.split_at(shape.log_k());
+                let ra_folded =
+                    address_fold::<AkitaField>(witness, ram_ra_val_check(), shape.log_t, r_address)
+                        .unwrap();
+                let inc: Vec<AkitaField> = witness
+                    .oracle_table(ram_inc_val_check().polynomial_id())
+                    .unwrap();
+                let lt = LtPolynomial::evaluations(r_cycle);
+                let input_claim = (0..1usize << shape.log_t)
+                    .map(|j| inc[j] * ra_folded[j] * (lt[j] + challenges.gamma))
+                    .sum();
+                let round_challenges = (0..shape.log_t)
+                    .map(|_| AkitaField::random(&mut rng))
+                    .collect::<Vec<_>>();
+                run_lockstep(
+                    expected.as_mut(),
+                    actual.as_mut(),
+                    input_claim,
+                    &round_challenges,
+                );
+                assert_eq!(
+                    actual.output_claims(&claims).unwrap(),
+                    expected.output_claims(&claims).unwrap()
+                );
+                let output_points = relation
+                    .derive_opening_points(&round_challenges, &points)
+                    .unwrap();
+                actual
+                    .validate_derived_tables(&relation, &points, &output_points, &challenges)
+                    .unwrap();
+            });
+        }
     }
 
     #[test]
@@ -505,7 +673,7 @@ mod tests {
                 PrepareKernel::prepare(&metal, &mut session, witness, inputs()).unwrap();
             assert_eq!(metal.ram_val_sparse_sequences(), 1);
             assert!(session.state::<RamRafAddressPlane>().is_none());
-            assert!(session.state::<Arc<RamIncrementActivity>>().is_none());
+            assert!(session.state::<Arc<RamIncrementActivity>>().is_some());
             assert!(Arc::ptr_eq(
                 &shared_owner,
                 session
@@ -539,6 +707,31 @@ mod tests {
                 .unwrap();
             actual
                 .validate_derived_tables(&relation, &points, &output_points, &challenges)
+                .unwrap();
+
+            let mut host = prepare_host_sparse_ram_val_check(
+                &mut session,
+                witness,
+                &relation,
+                &points.ram_val,
+                challenges.gamma,
+            )
+            .unwrap()
+            .expect("RAM value-check retains its host sparse fallback");
+            let mut host_expected = OptimizedBackend
+                .prepare(&mut ProofSession::default(), witness, inputs())
+                .unwrap();
+            run_lockstep(
+                host_expected.as_mut(),
+                &mut host,
+                input_claim,
+                &round_challenges,
+            );
+            assert_eq!(
+                host.output_claims(&claims).unwrap(),
+                host_expected.output_claims(&claims).unwrap()
+            );
+            host.validate_derived_tables(&relation, &points, &output_points, &challenges)
                 .unwrap();
 
             let mut direct_session = ProofSession::default();
