@@ -1092,7 +1092,7 @@ impl<F: JoltField> OptimizedInstructionReadRafKernel<F> {
         self.suffix_tables = suffix_tables;
         let checkpoints = self.prefix_checkpoints.as_slice();
         let prefix_indices = self.prefix_indices.as_slice();
-        self.prefix_tables = map_indices(prefix_indices.len(), |position| {
+        let make_prefix = |position: usize| {
             let index = prefix_indices[position];
             let prefix = &ALL_PREFIXES[index];
             Polynomial::new(
@@ -1108,7 +1108,12 @@ impl<F: JoltField> OptimizedInstructionReadRafKernel<F> {
                     })
                     .collect(),
             )
-        });
+        };
+        self.prefix_tables = if self.external_address_phases {
+            (0..prefix_indices.len()).map(make_prefix).collect()
+        } else {
+            map_indices(prefix_indices.len(), make_prefix)
+        };
         self.phase_challenges.clear();
     }
 
@@ -1190,60 +1195,65 @@ impl<F: JoltField> OptimizedInstructionReadRafKernel<F> {
     fn address_message(&self, previous_claim: F) -> UnivariatePoly<F> {
         let half = self.raf_left.prefix.evals().len() / 2;
         // Partial sums: [read, left, right, identity, upper] × {c=0, c=2}.
-        let sums = map_reduce_chunks(
-            half,
-            (half / 8).max(8),
-            |range| {
-                let mut sums = [F::zero(); 10];
-                // Per-thread scratch: full prefix eval rows (indexed by the
-                // `Prefixes` discriminant, as `combine` expects) plus suffix
-                // eval rows reused across tables.
-                let mut p0 = vec![PrefixEval::from(F::zero()); self.prefix_checkpoints.len()];
-                let mut p2 = vec![PrefixEval::from(F::zero()); self.prefix_checkpoints.len()];
-                let mut s0: Vec<SuffixEval<F>> = Vec::new();
-                let mut s2: Vec<SuffixEval<F>> = Vec::new();
-                for b in range {
-                    for (&index, table) in self.prefix_indices.iter().zip(&self.prefix_tables) {
-                        let (lo, ext) = extension_pair(table.evals(), b, half);
-                        p0[index] = PrefixEval::from(lo);
-                        p2[index] = PrefixEval::from(ext);
-                    }
-                    for (table, suffixes) in &self.suffix_tables {
-                        s0.clear();
-                        s2.clear();
-                        for q in suffixes {
-                            let (lo, ext) = extension_pair(q.evals(), b, half);
-                            s0.push(SuffixEval::from(lo));
-                            s2.push(SuffixEval::from(ext));
-                        }
-                        sums[0] += table.combine(&p0, &s0);
-                        sums[1] += table.combine(&p2, &s2);
-                    }
-                    let (left0, left2) = self.raf_left.message_evals(b, half);
-                    let (right0, right2) = self.raf_right.message_evals(b, half);
-                    let (id0, id2) = self.raf_identity.message_evals(b, half);
-                    sums[2] += left0;
-                    sums[3] += left2;
-                    sums[4] += right0;
-                    sums[5] += right2;
-                    sums[6] += id0;
-                    sums[7] += id2;
-                    if CANONICAL_INSTRUCTION_ADDRESS {
-                        let (upper0, upper2) = self.raf_upper_all_ones.message_evals(b, half);
-                        sums[8] += upper0;
-                        sums[9] += upper2;
-                    }
+        let address_sums = |range: std::ops::Range<usize>| {
+            let mut sums = [F::zero(); 10];
+            // Per-thread scratch: full prefix eval rows (indexed by the
+            // `Prefixes` discriminant, as `combine` expects) plus suffix
+            // eval rows reused across tables.
+            let mut p0 = vec![PrefixEval::from(F::zero()); self.prefix_checkpoints.len()];
+            let mut p2 = vec![PrefixEval::from(F::zero()); self.prefix_checkpoints.len()];
+            let mut s0: Vec<SuffixEval<F>> = Vec::new();
+            let mut s2: Vec<SuffixEval<F>> = Vec::new();
+            for b in range {
+                for (&index, table) in self.prefix_indices.iter().zip(&self.prefix_tables) {
+                    let (lo, ext) = extension_pair(table.evals(), b, half);
+                    p0[index] = PrefixEval::from(lo);
+                    p2[index] = PrefixEval::from(ext);
                 }
-                sums
-            },
-            |mut a, b| {
-                for (a, b) in a.iter_mut().zip(&b) {
-                    *a += *b;
+                for (table, suffixes) in &self.suffix_tables {
+                    s0.clear();
+                    s2.clear();
+                    for q in suffixes {
+                        let (lo, ext) = extension_pair(q.evals(), b, half);
+                        s0.push(SuffixEval::from(lo));
+                        s2.push(SuffixEval::from(ext));
+                    }
+                    sums[0] += table.combine(&p0, &s0);
+                    sums[1] += table.combine(&p2, &s2);
                 }
-                a
-            },
-            || [F::zero(); 10],
-        );
+                let (left0, left2) = self.raf_left.message_evals(b, half);
+                let (right0, right2) = self.raf_right.message_evals(b, half);
+                let (id0, id2) = self.raf_identity.message_evals(b, half);
+                sums[2] += left0;
+                sums[3] += left2;
+                sums[4] += right0;
+                sums[5] += right2;
+                sums[6] += id0;
+                sums[7] += id2;
+                if CANONICAL_INSTRUCTION_ADDRESS {
+                    let (upper0, upper2) = self.raf_upper_all_ones.message_evals(b, half);
+                    sums[8] += upper0;
+                    sums[9] += upper2;
+                }
+            }
+            sums
+        };
+        let sums = if self.external_address_phases {
+            address_sums(0..half)
+        } else {
+            map_reduce_chunks(
+                half,
+                (half / 8).max(8),
+                address_sums,
+                |mut a, b| {
+                    for (a, b) in a.iter_mut().zip(&b) {
+                        *a += *b;
+                    }
+                    a
+                },
+                || [F::zero(); 10],
+            )
+        };
 
         let gamma_sqr = self.gamma * self.gamma;
         let mut eval_0 = sums[0] + self.gamma * sums[2] + gamma_sqr * (sums[4] + sums[6]);
@@ -1479,14 +1489,21 @@ impl<F: JoltField> OptimizedInstructionReadRafKernel<F> {
                 table.bind_with_order(challenge, BindingOrder::HighToLow);
             };
             #[cfg(feature = "parallel")]
-            let ((), ()) = rayon::join(
-                || self.prefix_tables.par_iter_mut().for_each(bind_dense),
-                || {
-                    self.suffix_tables.par_iter_mut().for_each(|(_, suffixes)| {
-                        suffixes.iter_mut().for_each(bind_dense);
-                    });
-                },
-            );
+            if self.external_address_phases {
+                self.prefix_tables.iter_mut().for_each(bind_dense);
+                self.suffix_tables
+                    .iter_mut()
+                    .for_each(|(_, suffixes)| suffixes.iter_mut().for_each(bind_dense));
+            } else {
+                let ((), ()) = rayon::join(
+                    || self.prefix_tables.par_iter_mut().for_each(bind_dense),
+                    || {
+                        self.suffix_tables.par_iter_mut().for_each(|(_, suffixes)| {
+                            suffixes.iter_mut().for_each(bind_dense);
+                        });
+                    },
+                );
+            }
             #[cfg(not(feature = "parallel"))]
             {
                 self.prefix_tables.iter_mut().for_each(bind_dense);
