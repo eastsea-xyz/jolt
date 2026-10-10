@@ -592,7 +592,7 @@ impl RamRafSequence {
     }
 
     fn submit_command(&self) -> RamRafCommand {
-        let command_buffer = self.context.queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let blit = command_buffer.new_blit_command_encoder();
             blit.fill_buffer(
@@ -750,7 +750,7 @@ impl RamRafSegmentedSequence {
     }
 
     fn submit_command(&self) -> RamRafSegmentedCommand {
-        let command_buffer = self.context.queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let blit = command_buffer.new_blit_command_encoder();
             blit.fill_buffer(

@@ -960,7 +960,7 @@ impl InstructionInputSequenceStorage {
             reserved: 0,
         };
         let gamma = Fp128::from_jolt_field(&AkitaField::zero());
-        let command_buffer = self.context.queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipelines.native_message);

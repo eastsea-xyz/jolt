@@ -1658,7 +1658,7 @@ impl ProductRemainderSequence {
 
     pub(in crate::metal::solinas) fn submit_state_b_fill(&self) -> Option<CommandBuffer> {
         self.state_b_fill_queue.as_ref().map(|queue| {
-            let command = queue.new_command_buffer().to_owned();
+            let command = autoreleasepool(|| queue.new_command_buffer().to_owned());
             let encoder = command.new_blit_command_encoder();
             encoder.fill_buffer(
                 &self.buffers.state_b,

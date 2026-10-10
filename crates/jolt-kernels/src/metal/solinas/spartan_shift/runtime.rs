@@ -529,7 +529,7 @@ impl SpartanShiftPrefixInvocation {
 
     fn submit_command(&self) -> Result<SpartanShiftSubmittedCommand, MetalError> {
         self.rows.validate_for(&self.context, &self.plan)?;
-        let command_buffer = self.context.queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| -> Result<(), MetalError> {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.build_pipeline);
@@ -633,7 +633,7 @@ impl SpartanShiftFoldInvocation {
 
     fn submit_command(&self) -> Result<SpartanShiftSubmittedCommand, MetalError> {
         self.rows.validate_for(&self.context, &self.plan)?;
-        let command_buffer = self.context.queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline);

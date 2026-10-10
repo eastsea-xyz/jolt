@@ -767,7 +767,7 @@ impl BooleanitySequence {
             reserved: 0,
         };
         let queue = self.context.queue.clone();
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.finish_pipeline);
@@ -778,10 +778,10 @@ impl BooleanitySequence {
             self.encode_field_dispatch(encoder, self.polys);
             encoder.end_encoding();
             command_buffer.commit();
-            crate::metal::profiling::record_submission(command_buffer);
+            crate::metal::profiling::record_submission(&command_buffer);
             command_buffer.wait_until_completed();
         });
-        validate_completed_command(command_buffer)?;
+        validate_completed_command(&command_buffer)?;
         self.dense_elements = 1;
         self.dense_source_in_a = !self.dense_source_in_a;
         Ok(())
@@ -872,7 +872,7 @@ impl BooleanitySequence {
         )?;
 
         let queue = self.context.queue.clone();
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             self.encode_initial_constant(encoder);
@@ -929,11 +929,11 @@ impl BooleanitySequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
-            crate::metal::profiling::record_submission(command_buffer);
+            crate::metal::profiling::record_submission(&command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
-        let message = self.finish_command(command_buffer, final_in_a)?;
+        let message = self.finish_command(&command_buffer, final_in_a)?;
         self.initial_constant_ready = true;
         if challenge.is_some() {
             self.branch_width = next_width;
@@ -970,7 +970,7 @@ impl BooleanitySequence {
         let challenge = Fp128::from_jolt_field(&challenge);
 
         let queue = self.context.queue.clone();
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             self.encode_weight_transitions(encoder, weight_transitions);
@@ -999,11 +999,11 @@ impl BooleanitySequence {
             )?;
             encoder.end_encoding();
             command_buffer.commit();
-            crate::metal::profiling::record_submission(command_buffer);
+            crate::metal::profiling::record_submission(&command_buffer);
             command_buffer.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
-        let message = self.finish_command(command_buffer, final_in_a)?;
+        let message = self.finish_command(&command_buffer, final_in_a)?;
         self.dense_elements /= 2;
         self.dense_source_in_a = !self.dense_source_in_a;
         Ok(message)

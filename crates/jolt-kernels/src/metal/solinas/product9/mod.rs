@@ -454,7 +454,7 @@ impl Product9Sequence {
             materialize: u32::from(materialize),
             reserved: 0,
         };
-        let command = self.context.queue.new_command_buffer();
+        let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         let final_in_a = autoreleasepool(|| {
             let blit = command.new_blit_command_encoder();
             blit.fill_buffer(&self.buffers.status, NSRange::new(0, 4), 0);
@@ -542,9 +542,9 @@ impl Product9Sequence {
             )?;
             encoder.end_encoding();
             command.commit();
-            crate::metal::profiling::record_submission(command);
+            crate::metal::profiling::record_submission(&command);
             command.wait_until_completed();
-            validate_completed_command(command)?;
+            validate_completed_command(&command)?;
             // Reap the profiling owner before dropping aliases or handing the
             // dense tail back to the CPU; completed work stays accounted.
             let _ = crate::metal::profiling::snapshot();

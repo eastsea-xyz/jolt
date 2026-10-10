@@ -322,7 +322,7 @@ impl SolinasMetal {
 
 impl RamRaClaimReductionSequence {
     pub(crate) fn build_q(&self) -> Result<RamRaClaimQObservation, MetalError> {
-        let command = self.context.queue.new_command_buffer().to_owned();
+        let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.build_q_pipeline);
@@ -423,7 +423,7 @@ impl RamRaClaimReductionSequence {
         self.context
             .validate_inputs("RAM RA claim bound-prefix equality", &encoded_prefix)?;
         let eq_prefix = buffer_from_slice(&self.context.device, &encoded_prefix);
-        let command = self.context.queue.new_command_buffer().to_owned();
+        let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.gather_h_pipeline);

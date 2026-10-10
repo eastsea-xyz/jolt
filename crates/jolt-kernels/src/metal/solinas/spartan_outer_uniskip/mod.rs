@@ -891,7 +891,7 @@ impl SolinasMetal {
             .device
             .new_buffer(checksum_bytes, MTLResourceOptions::StorageModePrivate);
 
-        let command = self.queue.new_command_buffer().to_owned();
+        let command = autoreleasepool(|| self.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&pipeline);

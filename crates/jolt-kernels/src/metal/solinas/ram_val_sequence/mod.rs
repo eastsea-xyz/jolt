@@ -670,7 +670,7 @@ impl RamValSequence {
                 .map_err(|_| MetalError::InputTooLong(self.lt_lo.len()))?,
         };
         let queue = self.context.device.new_command_queue();
-        let command_buffer = queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         let final_in_a = autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(self.prefix_pipeline(1)?);

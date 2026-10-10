@@ -770,7 +770,7 @@ impl RegistersValFirstMessageInvocation {
 
     fn submit_first_message(&self) -> RegistersValFirstMessageCommand {
         self.completed.set(false);
-        let command_buffer = self.context.queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.message_pipeline);

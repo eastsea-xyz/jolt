@@ -491,7 +491,7 @@ impl OuterRemainderSequence {
         let dense = self.dense_storage()?;
         let cold_rows = rows.cold_buffer()?;
         let queue = self.storage.context.queue.clone();
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.storage.pipelines.materialize);
@@ -518,10 +518,10 @@ impl OuterRemainderSequence {
             );
             encoder.end_encoding();
             command_buffer.commit();
-            crate::metal::profiling::record_submission(command_buffer);
+            crate::metal::profiling::record_submission(&command_buffer);
             command_buffer.wait_until_completed();
         });
-        self.finish_command(command_buffer)?;
+        self.finish_command(&command_buffer)?;
         let output = self.storage.buffers.message_output.clone();
         let endpoints = self.read_array::<2>(&output, "outer endpoints")?;
         self.phase = OuterRemainderPhase::BOnly;
@@ -561,7 +561,7 @@ impl OuterRemainderSequence {
         let rows = self.rows()?;
         let dense = self.dense_storage()?;
         let queue = self.storage.context.queue.clone();
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.storage.pipelines.stream_bind);
@@ -587,10 +587,10 @@ impl OuterRemainderSequence {
             );
             encoder.end_encoding();
             command_buffer.commit();
-            crate::metal::profiling::record_submission(command_buffer);
+            crate::metal::profiling::record_submission(&command_buffer);
             command_buffer.wait_until_completed();
         });
-        self.finish_command(command_buffer)?;
+        self.finish_command(&command_buffer)?;
         let output = self.storage.buffers.message_output.clone();
         let endpoints = self.read_array::<2>(&output, "outer endpoints")?;
         self.current_elements /= 2;
@@ -628,7 +628,7 @@ impl OuterRemainderSequence {
             .validate_inputs("outer challenge", slice::from_ref(&challenge))?;
         let (source, destination) = self.dense_buffers()?;
         let queue = self.storage.context.queue.clone();
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.storage.pipelines.transition);
@@ -653,10 +653,10 @@ impl OuterRemainderSequence {
             );
             encoder.end_encoding();
             command_buffer.commit();
-            crate::metal::profiling::record_submission(command_buffer);
+            crate::metal::profiling::record_submission(&command_buffer);
             command_buffer.wait_until_completed();
         });
-        self.finish_command(command_buffer)?;
+        self.finish_command(&command_buffer)?;
         let output = self.storage.buffers.message_output.clone();
         let endpoints = self.read_array::<2>(&output, "outer endpoints")?;
         self.current_elements /= 2;
@@ -796,7 +796,7 @@ impl OuterRemainderSequence {
         let threadgroup_memory =
             opening_threadgroup_memory_lengths(threads, self.config.product_uniskip_carrier)?;
         let queue = self.storage.context.queue.clone();
-        let command_buffer = queue.new_command_buffer().to_owned();
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
         if self.storage.buffers.registers_claim.is_some()
             && (self.storage.pipelines.registers_claim_build.is_none()
                 || self.storage.pipelines.registers_claim_reduce.is_none()
