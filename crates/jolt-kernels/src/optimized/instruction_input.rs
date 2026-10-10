@@ -83,6 +83,13 @@ pub(crate) fn prepare_instruction_input_rows<F: JoltField>(
     witness: &dyn JoltWitnessPlane<F>,
     trace_elements: usize,
 ) -> Result<(), KernelError<F>> {
+    // Stage 3 can retain the witness's owning row view directly.
+    if witness
+        .owned_rows()
+        .is_some_and(|rows| trace_elements <= rows.cycles())
+    {
+        return Ok(());
+    }
     let rows = collect_rows(witness, trace_elements)?;
     session.park(PreparedInstructionInputRows { rows });
     Ok(())
@@ -809,6 +816,150 @@ mod tests {
         optimized
             .validate_derived_tables(&relation, &input_points, &output_points, &challenges)
             .unwrap();
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    mod prepared_rows {
+        use jolt_claims::protocols::jolt::{
+            JoltCommittedPolynomial, JoltPolynomialId, JoltVirtualPolynomial,
+        };
+        use jolt_field::CanonicalBytes as _;
+        use jolt_witness::{
+            ChunkVisitor, JoltWitnessOracle, JoltWitnessPlane, ProgramSource, RowSource, Shape,
+            WitnessError,
+        };
+
+        use super::*;
+        use crate::optimized::instruction_input::{
+            prepare_instruction_input_rows, OptimizedInstructionInput, PreparedInstructionInputRows,
+        };
+        use crate::{PrepareKernel, ProofSession, ReferenceBackend};
+
+        // Preserve the existing row walk and oracle; hide only the optional
+        // owning view to exercise the retained streaming fallback.
+        struct StreamingWitness<'a>(&'a dyn JoltWitnessPlane<Fr>);
+
+        impl JoltWitnessOracle<Fr> for StreamingWitness<'_> {
+            fn shape(&self, id: JoltPolynomialId) -> Result<Shape, WitnessError> {
+                self.0.shape(id)
+            }
+
+            fn oracle_table(&self, id: JoltPolynomialId) -> Result<Vec<Fr>, WitnessError> {
+                self.0.oracle_table(id)
+            }
+
+            fn committed_order(&self) -> Result<Vec<JoltCommittedPolynomial>, WitnessError> {
+                self.0.committed_order()
+            }
+        }
+
+        impl ProgramSource for StreamingWitness<'_> {
+            fn program_preprocessing(&self) -> &jolt_program::preprocess::JoltProgramPreprocessing {
+                self.0.program_preprocessing()
+            }
+        }
+
+        impl RowSource for StreamingWitness<'_> {
+            fn visit_chunks(
+                &self,
+                range: std::ops::Range<usize>,
+                chunk_size: usize,
+                visitor: &mut ChunkVisitor<'_>,
+            ) -> Result<(), WitnessError> {
+                self.0.visit_chunks(range, chunk_size, visitor)
+            }
+        }
+
+        fn assert_witness_parity(
+            witness: &dyn JoltWitnessPlane<Fr>,
+            log_t: usize,
+            retain_rows: bool,
+        ) {
+            let mut session = ProofSession::default();
+            prepare_instruction_input_rows(&mut session, witness, 1 << log_t).unwrap();
+            assert_eq!(
+                session
+                    .state::<PreparedInstructionInputRows>()
+                    .map(|rows| rows.len()),
+                retain_rows.then_some(1 << log_t),
+                "a covering owning witness must not allocate prepared row copies"
+            );
+            let point = (0..log_t)
+                .map(|index| fr(900 + 53 * index as u64))
+                .collect::<Vec<_>>();
+            let relation = InstructionInput::<Fr>::new(TraceDimensions::new(log_t), point.clone());
+            let evaluate = |id| {
+                Polynomial::new(witness.oracle_table(JoltPolynomialId::Virtual(id)).unwrap())
+                    .evaluate(&point)
+            };
+            let claims = InstructionInputInputClaims {
+                right_instruction_input: evaluate(JoltVirtualPolynomial::RightInstructionInput),
+                left_instruction_input: evaluate(JoltVirtualPolynomial::LeftInstructionInput),
+            };
+            let points = InstructionInputInputClaims {
+                right_instruction_input: point.clone(),
+                left_instruction_input: point,
+            };
+            let challenges = InstructionInputChallenges {
+                gamma: fr(0xDADA_CAFE),
+            };
+            let inputs = || ProverInputs {
+                relation: &relation,
+                claims: &claims,
+                points: &points,
+                challenges: &challenges,
+            };
+            let mut actual = OptimizedInstructionInput
+                .prepare(&mut session, witness, inputs())
+                .unwrap();
+            assert!(session.state::<PreparedInstructionInputRows>().is_none());
+            let mut reference = ReferenceBackend
+                .prepare(&mut ProofSession::default(), witness, inputs())
+                .unwrap();
+            assert_eq!(actual.num_rounds(), reference.num_rounds());
+            let bytes = |polynomial: &jolt_poly::UnivariatePoly<Fr>| {
+                polynomial
+                    .coefficients()
+                    .iter()
+                    .flat_map(|value| value.to_bytes_le_vec())
+                    .collect::<Vec<_>>()
+            };
+            let mut claim =
+                claims.right_instruction_input + challenges.gamma * claims.left_instruction_input;
+            for round in 0..reference.num_rounds() {
+                let bind = round.checked_sub(1).map(challenge);
+                let oracle = reference.prove_round(bind, round, claim).unwrap();
+                let polynomial = actual.prove_round(bind, round, claim).unwrap();
+                assert_eq!(bytes(&polynomial), bytes(&oracle), "round {round}");
+                claim = oracle.evaluate(challenge(round));
+            }
+            let last_bind = challenge(reference.num_rounds() - 1);
+            reference.finish_rounds(last_bind).unwrap();
+            actual.finish_rounds(last_bind).unwrap();
+            assert_eq!(
+                actual.output_claims(&claims).unwrap(),
+                reference.output_claims(&claims).unwrap()
+            );
+        }
+
+        #[test]
+        fn covering_owned_rows_skip_prepared_copy_and_match_reference() {
+            for log_t in [1, 2, 3, 4] {
+                jolt_witness::testing::with_sample_backend_at_log_t(log_t, 4, |witness| {
+                    assert!(RowSource::owned_rows(witness).is_some());
+                    assert_witness_parity(witness, log_t, false);
+                });
+            }
+        }
+
+        #[test]
+        fn streaming_rows_keep_prepared_copy_and_match_reference() {
+            jolt_witness::testing::with_sample_backend_at_log_t(3, 4, |witness| {
+                let streaming = StreamingWitness(witness);
+                assert!(streaming.owned_rows().is_none());
+                assert_witness_parity(&streaming, 3, true);
+            });
+        }
     }
 
     #[test]
