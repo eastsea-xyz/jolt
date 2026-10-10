@@ -245,7 +245,10 @@ impl MetalBackend {
         }
         if config.registers_val_evaluation.source == RegistersValEvaluationSource::Stage1Resident
             && (config.instruction_read_raf.address_cutoff_elements
-                > config.registers_val_evaluation.trace_cutoff_elements.max(1 << 26)
+                > config
+                    .registers_val_evaluation
+                    .trace_cutoff_elements
+                    .max(1 << 26)
                 || !(1 << 22..=1 << 28)
                     .contains(&config.registers_val_evaluation.trace_cutoff_elements)
                 || config.registers_val_evaluation.cutoff_elements
@@ -428,7 +431,7 @@ mod tests {
             config.registers_val_evaluation.trace_cutoff_elements,
             1 << 22
         );
-        assert_eq!(config.instruction_read_raf.address_cutoff_elements, 1 << 24);
+        assert_eq!(config.instruction_read_raf.address_cutoff_elements, 1 << 22);
         assert_eq!(config.registers_read_write.trace_cutoff_elements, 1 << 22);
         assert_eq!(
             config.ram_read_write.gpu_record_scatter_cutoff_elements,

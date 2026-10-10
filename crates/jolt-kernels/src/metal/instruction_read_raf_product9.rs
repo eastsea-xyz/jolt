@@ -7,6 +7,12 @@ use jolt_sumcheck::{ProveRounds, RoundExecutionDomain, SumcheckError};
 use super::solinas::{Product9ResidentSource, Product9Sequence, SolinasMetal};
 use crate::optimized::instruction_read_raf::OptimizedInstructionReadRafKernel;
 
+const PRODUCT9_CPU_TAIL_CAP: usize = 1 << 12;
+
+pub(crate) const fn native_product9_shape(rows: usize, virtual_ra_polys: usize) -> bool {
+    virtual_ra_polys == 8 && (rows == 1 << 22 || rows == 1 << 24)
+}
+
 pub(crate) struct Product9CycleAdapter {
     sequence: Option<Product9Sequence>,
     host_tail: Option<[Vec<AkitaField>; 9]>,
@@ -23,6 +29,7 @@ impl Product9CycleAdapter {
         if !(2..=1 << 16).contains(&cutoff) || !cutoff.is_power_of_two() {
             return Err(error("Product9 CPU tail cutoff outside bounded range"));
         }
+        let cutoff = cutoff.min(PRODUCT9_CPU_TAIL_CAP);
         let rows = source.rows();
         let input = cpu.metal_product9_cycle_input()?;
         let (e_in, e_out) = cpu.metal_cycle_weights()?;
@@ -118,9 +125,10 @@ mod tests {
 
     use jolt_claims::protocols::jolt::geometry::instruction::InstructionReadRafDimensions;
     use jolt_claims::protocols::jolt::relations::instruction::InstructionReadRafInputClaims;
-    use jolt_field::{One as _, Ring as _, Zero as _};
+    use jolt_field::{Field as _, One as _, Ring as _, Zero as _};
     use jolt_lookup_tables::{LookupBits, LookupTableKind, XLEN};
     use jolt_witness::witnesses::FusedInc;
+    use rand_core::{RngCore as _, SeedableRng as _};
 
     use super::*;
     use crate::reference::views::eq_table;
@@ -134,19 +142,38 @@ mod tests {
     fn g8_instruction_read_raf_gpu_cycle_matches_entire_cpu_member() {
         for log_t in [9, 10] {
             for gamma in [AkitaField::zero(), AkitaField::one(), field(313)] {
-                member_parity(log_t, gamma);
+                member_parity(log_t, gamma, None, 4);
             }
         }
     }
 
-    fn member_parity(log_t: usize, gamma: AkitaField) {
+    #[test]
+    fn g8_instruction_read_raf_gpu_cycle_matches_random_cpu_member() {
+        for (log_t, seed) in [(9, 0x4509u64), (10, 0x4510), (19, 0x4519)] {
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed ^ 0x67ba_0398);
+            let gamma = AkitaField::random(&mut rng);
+            member_parity(log_t, gamma, Some(seed), 1 << 16);
+        }
+    }
+
+    fn member_parity(
+        log_t: usize,
+        gamma: AkitaField,
+        random_seed: Option<u64>,
+        requested_cutoff: usize,
+    ) {
         let rows = 1 << log_t;
+        let mut rng = random_seed.map(rand_chacha::ChaCha20Rng::seed_from_u64);
         let lookups: Vec<u128> = (0..rows)
             .map(|row| match row {
                 0 => 0,
                 1 => u128::MAX,
                 2 => 255u128 << 64,
                 3 => 255u128 << 56,
+                _ if rng.is_some() => {
+                    let rng = rng.as_mut().unwrap();
+                    (u128::from(rng.next_u64()) << 64) | u128::from(rng.next_u64())
+                }
                 _ => {
                     let high = (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                     let low = (row as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -157,6 +184,11 @@ mod tests {
         let tables: Vec<_> = LookupTableKind::<XLEN>::iter().collect();
         let claims: Vec<u8> = (0..rows)
             .map(|row| {
+                if let Some(rng) = rng.as_mut() {
+                    let table = (rng.next_u64() % (tables.len() as u64 + 1)) as u8;
+                    let flags = (rng.next_u64() as u8) & 0xc0;
+                    return table | flags;
+                }
                 let table = if row % 5 == 0 {
                     0
                 } else {
@@ -183,7 +215,10 @@ mod tests {
         let dimensions =
             InstructionReadRafDimensions::new(log_t, 128, NonZeroUsize::new(8).unwrap());
         let reduction: Vec<_> = (0..log_t)
-            .map(|index| field(101 + 7 * index as u64))
+            .map(|index| {
+                rng.as_mut()
+                    .map_or_else(|| field(101 + 7 * index as u64), AkitaField::random)
+            })
             .collect();
         let mut expected = OptimizedInstructionReadRafKernel::new(
             dimensions,
@@ -220,11 +255,19 @@ mod tests {
             .map(|round| match round {
                 1 | 130 => AkitaField::zero(),
                 2 | 131 => AkitaField::one(),
-                _ => field(797 + 17 * round as u64),
+                128 if random_seed.is_some() => AkitaField::zero(),
+                _ => rng
+                    .as_mut()
+                    .map_or_else(|| field(797 + 17 * round as u64), AkitaField::random),
             })
             .collect();
         let mut adapter = None;
         let mut saw_cpu_tail = false;
+        let mut saw_cap_handoff = false;
+        if random_seed.is_some() {
+            assert_ne!(binds[127], AkitaField::zero());
+            assert_ne!(binds[127], binds[128]);
+        }
         for round in 0..128 + log_t {
             let bind = round.checked_sub(1).map(|previous| binds[previous]);
             let oracle = expected.prove_round(bind, round, claim).unwrap();
@@ -237,14 +280,28 @@ mod tests {
                     // address bit. It must not also become the first cycle bind.
                     let cpu_first = actual.prove_round(cycle_bind.take(), round, claim).unwrap();
                     assert_eq!(cpu_first.coefficients(), oracle.coefficients());
+                    assert!(cycle_bind.is_none());
                     let context = SolinasMetal::for_akita().unwrap();
                     let source =
                         Product9ResidentSource::fixture(&context, &lookups, &claims).unwrap();
                     adapter = Some(
-                        Product9CycleAdapter::prepare(&mut actual, context, source, 4).unwrap(),
+                        Product9CycleAdapter::prepare(
+                            &mut actual,
+                            context,
+                            source,
+                            requested_cutoff,
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(
+                        adapter.as_ref().unwrap().cutoff,
+                        requested_cutoff.min(PRODUCT9_CPU_TAIL_CAP)
                     );
                 }
                 let adapter = adapter.as_mut().unwrap();
+                saw_cap_handoff |= adapter.sequence.as_ref().is_some_and(|sequence| {
+                    sequence.is_dense() && sequence.current_elements() == PRODUCT9_CPU_TAIL_CAP
+                });
                 let polynomial = adapter
                     .prove_round(&mut actual, cycle_bind, round, claim)
                     .unwrap();
@@ -259,6 +316,12 @@ mod tests {
             claim = oracle.evaluate(binds[round]);
         }
         assert!(saw_cpu_tail);
+        if log_t == 19 {
+            assert!(
+                saw_cap_handoff,
+                "large random fixture must restore at the actual 4096 cap"
+            );
+        }
         adapter.as_mut().unwrap().restore(&mut actual).unwrap();
         expected.finish_rounds(*binds.last().unwrap()).unwrap();
         actual.finish_rounds(*binds.last().unwrap()).unwrap();
@@ -269,5 +332,17 @@ mod tests {
         assert_eq!(gpu.instruction_ra, oracle.instruction_ra);
         assert_eq!(gpu.lookup_table_flags, oracle.lookup_table_flags);
         assert_eq!(gpu.instruction_raf_flag, oracle.instruction_raf_flag);
+    }
+
+    #[test]
+    fn native_product9_admission_is_bounded_to_g8_t22_t24() {
+        for log_t in [21, 22, 23, 24, 25, 26] {
+            for virtual_ra_polys in [4, 8, 16] {
+                assert_eq!(
+                    native_product9_shape(1 << log_t, virtual_ra_polys),
+                    virtual_ra_polys == 8 && matches!(log_t, 22 | 24),
+                );
+            }
+        }
     }
 }

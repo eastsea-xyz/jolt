@@ -10,7 +10,7 @@ use jolt_verifier::stages::stage5::InstructionReadRaf;
 use jolt_witness::{JoltWitnessPlane, PolynomialEncoding};
 
 use super::backend::MetalBackend;
-use super::instruction_read_raf_product9::Product9CycleAdapter;
+use super::instruction_read_raf_product9::{native_product9_shape, Product9CycleAdapter};
 use super::solinas::bytecode_read_raf_address::{
     BytecodeAddressFusedScatterRequest, BytecodeAddressSparseStage1Carrier,
     BytecodeAddressStage1TopologyOwner,
@@ -50,7 +50,7 @@ pub struct InstructionReadRafMetalConfig {
 impl Default for InstructionReadRafMetalConfig {
     fn default() -> Self {
         Self {
-            address_cutoff_elements: 1 << 24,
+            address_cutoff_elements: 1 << 22,
             stage1_scatter_threads_per_threadgroup: 256,
             address_dispatch: AddressPhaseSequenceConfig::default(),
             cutoff_elements: 1 << 16,
@@ -370,11 +370,14 @@ impl PrepareKernel<AkitaField, InstructionReadRaf<AkitaField>> for MetalBackend 
             || session
                 .state::<RegistersValInstructionSourceRequest>()
                 .is_some();
-        let retain_lookup_plane = trace_elements
-            >= self
-                .config
-                .instruction_ra_virtualization
-                .trace_cutoff_elements;
+        let virtual_ra_polys = dimensions.num_virtual_ra_polys();
+        let retain_lookup_plane = (use_metal_address
+            && native_product9_shape(trace_elements, virtual_ra_polys))
+            || trace_elements
+                >= self
+                    .config
+                    .instruction_ra_virtualization
+                    .trace_cutoff_elements;
         let stage1_owner = (use_metal_address
             && dimensions.num_virtual_ra_polys() + 1 == PRODUCT5_FACTORS)
             .then(|| session.take::<InstructionReadRafStage1Owner>())
@@ -647,6 +650,7 @@ impl PrepareKernel<AkitaField, InstructionReadRaf<AkitaField>> for MetalBackend 
             self.config.instruction_read_raf,
             use_metal_address,
             retain_lookup_plane,
+            virtual_ra_polys,
             resident_grouped_input,
         )?))
     }
@@ -667,6 +671,7 @@ pub(crate) struct MetalInstructionReadRafKernel {
     cpu: OptimizedInstructionReadRafKernel<AkitaField>,
     context: Arc<SolinasMetal>,
     config: InstructionReadRafMetalConfig,
+    virtual_ra_polys: usize,
     address_sequence: Option<Box<AddressPhaseSequence>>,
     resident_lookup_plane: Option<ResidentLookupIndexPlane>,
     sequence: Option<Product5Sequence>,
@@ -691,12 +696,14 @@ impl MetalInstructionReadRafKernel {
         config: InstructionReadRafMetalConfig,
         use_metal_address: bool,
         retain_lookup_plane: bool,
+        virtual_ra_polys: usize,
         resident_grouped_input: Option<ResidentGroupedInput>,
     ) -> Result<Self, SumcheckError<AkitaField>> {
         let mut kernel = Self {
             cpu,
             context,
             config,
+            virtual_ra_polys,
             address_sequence: None,
             resident_lookup_plane: None,
             sequence: None,
@@ -793,6 +800,14 @@ impl MetalInstructionReadRafKernel {
         Ok(())
     }
 
+    fn native_product9_carrier(&self) -> bool {
+        self.address_sequence.is_some()
+            && self
+                .resident_lookup_plane
+                .as_ref()
+                .is_some_and(|plane| native_product9_shape(plane.len(), self.virtual_ra_polys))
+    }
+
     fn restore_cpu_tail(&mut self) -> Result<(), SumcheckError<AkitaField>> {
         let _span = tracing::info_span!("MetalInstructionReadRaf::readback").entered();
         let sequence = self
@@ -816,12 +831,27 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
             return adapter.execution_domain();
         }
         // Scheduling happens before prove_round installs Product9. The retained
-        // T24 address carrier also launches GPU work at that first-cycle seam.
-        if self.address_sequence.is_some()
-            && self
-                .resident_lookup_plane
+        // Native G8 carriers must be scheduled on the accelerator before the
+        // final address bind creates pending cycle state. Retain the existing
+        // T24 scheduling behavior for the other address geometries.
+        if self.native_product9_carrier()
+            || (self.address_sequence.is_some()
+                && self
+                    .resident_lookup_plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.len() == 1 << 24))
+        {
+            return RoundExecutionDomain::Accelerator;
+        }
+        if (self.address_sequence.is_some()
+            && (self.cpu.metal_address_active() || self.cpu.metal_resident_cycle_available()))
+            || self
+                .sequence
                 .as_ref()
-                .is_some_and(|plane| plane.len() == 1 << 24)
+                .is_some_and(|sequence| sequence.current_elements() > self.config.cutoff_elements)
+            || self
+                .cpu
+                .metal_handoff_available(self.config.cutoff_elements)
         {
             return RoundExecutionDomain::Accelerator;
         }
@@ -853,12 +883,8 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
         }
 
         if self.product9.is_none()
-            && self.address_sequence.is_some()
+            && self.native_product9_carrier()
             && self.cpu.metal_product9_cycle_available()
-            && self
-                .resident_lookup_plane
-                .as_ref()
-                .is_some_and(|plane| plane.len() == 1 << 24)
         {
             let address = self
                 .address_sequence
@@ -1103,9 +1129,127 @@ fn metal_prepare_error(error: impl ToString) -> KernelError<AkitaField> {
 
 #[cfg(test)]
 mod tests {
-    use jolt_witness::testing::with_sample_backend_at_log_t;
+    use std::{num::NonZeroUsize, sync::Arc};
 
-    use super::committed_hamming_log_k_chunk;
+    use jolt_claims::protocols::jolt::geometry::instruction::InstructionReadRafDimensions;
+    use jolt_claims::protocols::jolt::relations::instruction::InstructionReadRafInputClaims;
+    use jolt_claims::protocols::jolt::{JoltPolynomialId, JoltVirtualPolynomial};
+    use jolt_field::{Field as _, Ring as _};
+    use jolt_poly::Polynomial;
+    use jolt_verifier::stages::stage5::instruction_read_raf::InstructionReadRafChallenges;
+    use jolt_witness::testing::with_sample_backend_at_log_t;
+    use rand_core::SeedableRng as _;
+
+    use super::*;
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "actual G4 wrapper parity and scheduling fixture"
+    )]
+    fn g4_address_and_cycle_gpu_work_has_accelerator_metadata() {
+        let log_t = 8;
+        let dimensions =
+            InstructionReadRafDimensions::new(log_t, 128, NonZeroUsize::new(4).unwrap());
+        with_sample_backend_at_log_t(log_t, 4, |witness| {
+            let mut random = rand_chacha::ChaCha8Rng::seed_from_u64(0x45_04);
+            let point = (0..log_t)
+                .map(|_| AkitaField::random(&mut random))
+                .collect::<Vec<_>>();
+            let gamma = AkitaField::from_u64(317);
+            let evaluate = |id| {
+                let table = jolt_witness::JoltWitnessOracle::<AkitaField>::oracle_table(
+                    witness,
+                    JoltPolynomialId::Virtual(id),
+                )
+                .unwrap();
+                Polynomial::new(table).evaluate(&point)
+            };
+            let claims = InstructionReadRafInputClaims {
+                lookup_output: evaluate(JoltVirtualPolynomial::LookupOutput),
+                left_lookup_operand: evaluate(JoltVirtualPolynomial::LeftLookupOperand),
+                right_lookup_operand: evaluate(JoltVirtualPolynomial::RightLookupOperand),
+            };
+            let points = InstructionReadRafInputClaims {
+                lookup_output: point.clone(),
+                left_lookup_operand: point.clone(),
+                right_lookup_operand: point,
+            };
+            let challenges = InstructionReadRafChallenges { gamma };
+            let relation = InstructionReadRaf::new(dimensions);
+            let inputs = || ProverInputs {
+                relation: &relation,
+                claims: &claims,
+                points: &points,
+                challenges: &challenges,
+            };
+            let mut expected = prepare_metal_instruction_read_raf(
+                &mut ProofSession::default(),
+                witness,
+                inputs(),
+                false,
+            )
+            .unwrap();
+            let cpu = prepare_metal_instruction_read_raf(
+                &mut ProofSession::default(),
+                witness,
+                inputs(),
+                true,
+            )
+            .unwrap();
+            let mut actual = MetalInstructionReadRafKernel::new(
+                cpu,
+                Arc::new(SolinasMetal::for_akita().unwrap()),
+                InstructionReadRafMetalConfig {
+                    cutoff_elements: 4,
+                    ..Default::default()
+                },
+                true,
+                false,
+                4,
+                None,
+            )
+            .unwrap();
+            let binds = (0..expected.num_rounds())
+                .map(|_| AkitaField::random(&mut random))
+                .collect::<Vec<_>>();
+            let mut claim = claims.lookup_output
+                + gamma * claims.left_lookup_operand
+                + gamma * gamma * claims.right_lookup_operand;
+            for round in 0..expected.num_rounds() {
+                let bind = round.checked_sub(1).map(|index| binds[index]);
+                let domain = actual.execution_domain();
+                let before = (actual.metal_address_phases, actual.metal_rounds);
+                let oracle = expected.prove_round(bind, round, claim).unwrap();
+                let polynomial = actual.prove_round(bind, round, claim).unwrap();
+                assert_eq!(polynomial.coefficients(), oracle.coefficients());
+                if before != (actual.metal_address_phases, actual.metal_rounds) {
+                    assert_eq!(domain, RoundExecutionDomain::Accelerator);
+                }
+                claim = oracle.evaluate(binds[round]);
+            }
+            assert!(actual.metal_address_phases > 1);
+            assert!(actual.metal_rounds > 1);
+            expected.finish_rounds(*binds.last().unwrap()).unwrap();
+            actual.finish_rounds(*binds.last().unwrap()).unwrap();
+            assert_eq!(
+                actual.output_claims(&claims).unwrap(),
+                expected.output_claims(&claims).unwrap()
+            );
+            assert_eq!(actual.execution_domain(), RoundExecutionDomain::Host);
+        });
+    }
+
+    #[test]
+    fn native_t22_address_producer_is_admitted_by_default() {
+        let config = InstructionReadRafMetalConfig::default();
+        for log_t in [22, 24] {
+            assert!(
+                config.address_cutoff_elements <= 1usize << log_t,
+                "the T{log_t} fixture must produce the resident Product9 address carrier"
+            );
+        }
+    }
 
     #[test]
     fn derives_committed_chunk_width_from_the_witness_grid() {

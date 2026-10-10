@@ -178,7 +178,7 @@ fn bytes<T>(elements: usize) -> Result<u64, MetalError> {
 
 #[cfg(test)]
 pub(crate) fn dense_scratch_bytes(rows: usize) -> Result<u64, Product9Error> {
-    if rows < 128 || rows > MAX_ROWS || !rows.is_power_of_two() {
+    if !(128..=MAX_ROWS).contains(&rows) || !rows.is_power_of_two() {
         return Err(Product9Error::State("rows outside bounded G8 domain"));
     }
     let fields = FACTORS
