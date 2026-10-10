@@ -4502,83 +4502,132 @@ mod tests {
     use jolt_field::Ring as _;
     use jolt_poly::{BindingOrder, GruenSplitEqPolynomial, Polynomial};
     use jolt_witness::RowSource as _;
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::{RngCore, SeedableRng};
 
     #[test]
     fn banks_preserve_global_increments_across_63_64_and_extreme_values() {
         let context = SolinasMetal::for_akita().unwrap();
+        let mut random = ChaCha8Rng::seed_from_u64(0x0636_4127);
+        let challenge_cases = [
+            [AkitaField::zero(); 4],
+            [AkitaField::one(); 4],
+            [
+                AkitaField::one(),
+                AkitaField::zero(),
+                AkitaField::zero(),
+                AkitaField::zero(),
+            ],
+            [
+                AkitaField::zero(),
+                AkitaField::one(),
+                AkitaField::zero(),
+                AkitaField::one(),
+            ],
+            std::array::from_fn(|_| {
+                AkitaField::from_u128(
+                    u128::from(random.next_u64()) | (u128::from(random.next_u64()) << 64),
+                )
+            }),
+        ];
         for (pre, post) in [(0, 1), (u64::MAX, 0), (0, u64::MAX)] {
-            let mut fixture = TraceFixture::new();
-            fixture.op(Some(63), None, None);
-            fixture.op(Some(64), None, None);
-            fixture.with_plane(4, |witness| {
-                let access = witness.random_access().unwrap();
-                let owner =
-                    Arc::new(AlignedPackedRegisterRows::collect_native(&access, 2).unwrap());
-                let rows = [
-                    PackedRegisterCycleRow::pack(RegisterCycleRow {
-                        rs1: None,
-                        rs2: None,
-                        rd: Some((63, pre, post)),
-                    }),
-                    PackedRegisterCycleRow::pack(RegisterCycleRow {
-                        rs1: None,
-                        rs2: None,
-                        rd: Some((64, 0, 2)),
-                    }),
-                ];
-                let source = buffer_from_slice(&context.device, &rows);
-                let mut banks = [0, 64].map(|base| {
-                    let mut sequence = context
-                        .prepare_registers_read_write_cycle_sequence_partition(
-                            Arc::clone(&owner),
-                            4,
-                            AkitaField::zero(),
-                            base,
-                        )
-                        .unwrap();
-                    // Owned copied rows let this test specify u64 endpoints exactly.
-                    sequence.source = Some(source.clone());
-                    sequence
-                });
-                let mut gruen =
-                    GruenSplitEqPolynomial::new(&[AkitaField::zero(); 4], BindingOrder::LowToHigh);
-                let mut quadratic = [AkitaField::zero(); 2];
-                for bank in &mut banks {
-                    let message = bank
-                        .message(
-                            gruen.e_in_current(),
-                            gruen.e_out_current(),
-                            AkitaField::zero(),
-                        )
-                        .unwrap();
-                    quadratic[0] += message.quadratic[0];
-                    quadratic[1] += message.quadratic[1];
-                }
-                if pre == 0 && post == 1 {
-                    assert_eq!(quadratic, [AkitaField::one(), -AkitaField::one()]);
-                }
-                let challenges = [AkitaField::zero(); 4];
-                for challenge in &challenges[..3] {
-                    gruen.bind(*challenge);
-                    for bank in &mut banks {
-                        let _ = bank
-                            .bind_and_message(
-                                *challenge,
-                                gruen.e_in_current(),
-                                gruen.e_out_current(),
+            for challenges in &challenge_cases {
+                let mut fixture = TraceFixture::new();
+                fixture.op(Some(63), None, None);
+                fixture.op(Some(64), None, None);
+                fixture.with_plane(4, |witness| {
+                    let access = witness.random_access().unwrap();
+                    let owner =
+                        Arc::new(AlignedPackedRegisterRows::collect_native(&access, 2).unwrap());
+                    let rows = [
+                        PackedRegisterCycleRow::pack(RegisterCycleRow {
+                            rs1: None,
+                            rs2: None,
+                            rd: Some((63, pre, post)),
+                        }),
+                        PackedRegisterCycleRow::pack(RegisterCycleRow {
+                            rs1: None,
+                            rs2: None,
+                            rd: Some((64, 0, 2)),
+                        }),
+                    ];
+                    let source = buffer_from_slice(&context.device, &rows);
+                    let mut banks = [0, 64].map(|base| {
+                        let mut sequence = context
+                            .prepare_registers_read_write_cycle_sequence_partition(
+                                Arc::clone(&owner),
+                                4,
+                                AkitaField::zero(),
+                                base,
                             )
                             .unwrap();
+                        // Owned copied rows let this test specify u64 endpoints exactly.
+                        sequence.source = Some(source.clone());
+                        sequence
+                    });
+                    let mut gruen = GruenSplitEqPolynomial::new(
+                        &[AkitaField::zero(); 4],
+                        BindingOrder::LowToHigh,
+                    );
+                    let mut quadratic = [AkitaField::zero(); 2];
+                    for bank in &mut banks {
+                        let message = bank
+                            .message(
+                                gruen.e_in_current(),
+                                gruen.e_out_current(),
+                                AkitaField::zero(),
+                            )
+                            .unwrap();
+                        quadratic[0] += message.quadratic[0];
+                        quadratic[1] += message.quadratic[1];
                     }
-                }
-                let mut inc = vec![AkitaField::zero(); 16];
-                inc[0] = AkitaField::from_u64(post) - AkitaField::from_u64(pre);
-                inc[1] = AkitaField::from_u64(2);
-                let point = challenges.iter().rev().copied().collect::<Vec<_>>();
-                let expected = Polynomial::new(inc).evaluate(&point);
-                for bank in &mut banks {
-                    assert_eq!(bank.finish(challenges[3]).unwrap().increment, expected);
-                }
-            });
+                    if pre == 0 && post == 1 {
+                        assert_eq!(quadratic, [AkitaField::one(), -AkitaField::one()]);
+                    }
+                    for challenge in &challenges[..3] {
+                        gruen.bind(*challenge);
+                        for bank in &mut banks {
+                            let _ = bank
+                                .bind_and_message(
+                                    *challenge,
+                                    gruen.e_in_current(),
+                                    gruen.e_out_current(),
+                                )
+                                .unwrap();
+                        }
+                    }
+                    let mut inc = vec![AkitaField::zero(); 16];
+                    inc[0] = AkitaField::from_u64(post) - AkitaField::from_u64(pre);
+                    inc[1] = AkitaField::from_u64(2);
+                    let point = challenges.iter().rev().copied().collect::<Vec<_>>();
+                    let expected = Polynomial::new(inc).evaluate(&point);
+                    let mut low_wa = vec![AkitaField::zero(); 16];
+                    low_wa[0] = AkitaField::one();
+                    let mut high_wa = vec![AkitaField::zero(); 16];
+                    high_wa[1] = AkitaField::one();
+                    let mut low_values = vec![AkitaField::from_u64(post); 16];
+                    low_values[0] = AkitaField::from_u64(pre);
+                    let mut high_values = vec![AkitaField::from_u64(2); 16];
+                    high_values[..2].fill(AkitaField::zero());
+                    let expected_wa =
+                        [low_wa, high_wa].map(|table| Polynomial::new(table).evaluate(&point));
+                    let expected_values = [low_values, high_values]
+                        .map(|table| Polynomial::new(table).evaluate(&point));
+                    for (bank_index, bank) in banks.iter_mut().enumerate() {
+                        let finished = bank.finish(challenges[3]).unwrap();
+                        assert_eq!(
+                            finished.increment, expected,
+                            "bank {bank_index}: global increment"
+                        );
+                        assert_eq!(finished.roots.len(), 1);
+                        let root = &finished.roots[0];
+                        assert_eq!(root.column, 63 + bank_index as u8);
+                        assert_eq!(root.ra, AkitaField::zero());
+                        assert_eq!(root.wa, expected_wa[bank_index]);
+                        assert_eq!(root.value, expected_values[bank_index]);
+                    }
+                });
+            }
         }
     }
 

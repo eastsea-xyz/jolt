@@ -992,7 +992,7 @@ mod tests {
                     .map(|index| AkitaField::from_u64((index % 2) as u64))
                     .collect()
             } else {
-                point(log_t + REGISTER_ADDRESS_BITS, seed ^ 101)
+                point(log_t + REGISTER_ADDRESS_BITS, seed ^ 0x65)
             };
             let mut expected = ReferenceBackend
                 .prepare(&mut ProofSession::default(), witness, inputs())

@@ -1245,6 +1245,56 @@ inline RegistersReadWriteMessageTerm registers_read_write_transition_fused(
     thread uint& next_count,
     thread ulong& next_mask)
 {
+    if (params.emit_message == 0u
+        && params.input_blocks == 2u
+        && params.output_blocks == 1u) {
+        // The terminal transition binds two indexed blocks into one direct
+        // block. It has no round message or equality-head domain.
+        ulong low_mask = input_masks[0];
+        ulong high_mask = input_masks[1];
+        ulong union_mask = low_mask | high_mask;
+        next_count = registers_read_write_mask_popcount(union_mask);
+        next_mask = union_mask;
+        uint low_base = registers_read_write_tiled_state_index(
+            0u, input_tile_bases, input_offsets, 0u);
+        uint high_base = registers_read_write_tiled_state_index(
+            1u, input_tile_bases, input_offsets, 0u);
+        uint output_base = registers_read_write_tiled_state_index(
+            0u, output_tile_bases, output_offsets, 0u);
+        uint output_length = 0u;
+        while (union_mask != 0ul) {
+            uint column = registers_read_write_mask_first_column(union_mask);
+            ulong bit = 1ul << column;
+            ulong lower = bit - 1ul;
+            union_mask &= union_mask - 1ul;
+            bool low_present = (low_mask & bit) != 0ul;
+            bool high_present = (high_mask & bit) != 0ul;
+            RegistersReadWriteIndexedStateCell low = {solinas_zero(), 0ul, 0ul, 0u, 0u};
+            RegistersReadWriteIndexedStateCell high = {solinas_zero(), 0ul, 0ul, 0u, 0u};
+            if (low_present) {
+                low = registers_read_write_load_indexed(
+                    low_base + registers_read_write_mask_popcount(low_mask & lower),
+                    input_previous, input_next, input_values, input_ra, input_wa);
+            }
+            if (high_present) {
+                high = registers_read_write_load_indexed(
+                    high_base + registers_read_write_mask_popcount(high_mask & lower),
+                    input_previous, input_next, input_values, input_ra, input_wa);
+            }
+            RegistersReadWriteDirectStateCell bound = registers_read_write_transition_cells(
+                low_present, low, high_present, high, ra_lut, wa_lut, challenge);
+            registers_read_write_store_direct_cell(
+                output_base + output_length, uchar(column), bound,
+                output_columns, output_previous, output_next, output_values, output_ra, output_wa);
+            output_length += 1u;
+        }
+        output_lengths[0] = uchar(output_length);
+        output_increments[0] = ram_read_write_bind(
+            input_increments[0], input_increments[1], challenge);
+        RegistersReadWriteMessageTerm result = {solinas_zero(), solinas_zero()};
+        return result;
+    }
+
     uint input_block[4] = {
         4u * work,
         4u * work + 1u,
