@@ -772,6 +772,8 @@ impl MetalError {
     }
 }
 
+pub(crate) use product9::{Product9CycleInput, Product9ResidentSource, Product9Sequence};
+
 #[cfg(test)]
 mod tests {
     use std::mem::{align_of, size_of};
@@ -842,5 +844,3 @@ mod tests {
         assert!(!Fp128::ZERO.is_canonical(0));
     }
 }
-
-pub(crate) use product9::{Product9CycleInput, Product9ResidentSource, Product9Sequence};

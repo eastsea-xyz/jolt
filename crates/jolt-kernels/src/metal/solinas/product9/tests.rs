@@ -77,13 +77,13 @@ fn cpu_q(
     e_out: &[AkitaField],
 ) -> [AkitaField; FACTORS] {
     let mut output = [AkitaField::zero(); FACTORS];
-    for outer in 0..e_out.len() {
+    for (outer, &outer_weight) in e_out.iter().enumerate() {
         for inner in 0..e_in.len() {
             let pair = outer * e_in.len() + inner;
             let lo: [AkitaField; FACTORS] = std::array::from_fn(|factor| tables[factor][2 * pair]);
             let hi: [AkitaField; FACTORS] =
                 std::array::from_fn(|factor| tables[factor][2 * pair + 1]);
-            for sample in 0..FACTORS {
+            for (sample, value) in output.iter_mut().enumerate() {
                 let mut product = AkitaField::one();
                 for factor in 0..FACTORS {
                     let delta = hi[factor] - lo[factor];
@@ -93,7 +93,7 @@ fn cpu_q(
                         lo[factor] + field((sample + 1) as u64) * delta
                     };
                 }
-                output[sample] += e_out[outer] * e_in[inner] * product;
+                *value += outer_weight * e_in[inner] * product;
             }
         }
     }
@@ -203,7 +203,7 @@ fn product9_rejects_invalid_claim_table_before_reading_values() {
     let source = Product9ResidentSource::fixture(&context, &lookups, &claims).unwrap();
     let mut sequence = Product9Sequence::new(context, source, metadata(), 8, 8).unwrap();
     assert!(matches!(
-        sequence.message(&vec![AkitaField::one(); 8], &vec![AkitaField::one(); 8]),
+        sequence.message(&[AkitaField::one(); 8], &[AkitaField::one(); 8]),
         Err(Product9Error::Source(1))
     ));
 }

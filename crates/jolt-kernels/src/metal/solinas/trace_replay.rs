@@ -847,9 +847,7 @@ mod tests {
     #[test]
     fn sampling_caps_do_not_hide_total_coverage() {
         let run = fixture();
-        let rows: Vec<_> = (0..MAX_CHUNKS + 1)
-            .flat_map(|_| run.iter().copied())
-            .collect();
+        let rows: Vec<_> = (0..=MAX_CHUNKS).flat_map(|_| run.iter().copied()).collect();
         let prepared = prepare(&rows).unwrap();
         assert_eq!(prepared.chunks.len(), MAX_CHUNKS);
         assert_eq!(prepared.report.supported_rows, rows.len());

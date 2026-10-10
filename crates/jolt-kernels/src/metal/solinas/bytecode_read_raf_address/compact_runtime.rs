@@ -438,12 +438,16 @@ mod tests {
     fn compact_prefix_rejects_overflow_and_population_mismatch() {
         assert!(prefix_counts(&[u32::MAX, 1], u32::MAX).is_err());
         assert!(prefix_counts(&[1, 2], 4).is_err());
-        assert_eq!(prefix_counts(&[0, 3, 0, 2], 5).unwrap(), [0, 0, 3, 3, 5]);
+        assert_eq!(
+            prefix_counts(&[0, 3, 0, 2], 5).unwrap_or_default(),
+            [0, 0, 3, 3, 5]
+        );
     }
 
     #[test]
     fn compact_waves_cover_every_row_once_across_a_hot_address_seam() {
-        let offsets = prefix_counts(&[0, 12_001, 2], 12_003).unwrap();
+        let offsets = prefix_counts(&[0, 12_001, 2], 12_003).unwrap_or_default();
+        assert_eq!(offsets, [0, 0, 12_001, 12_003]);
         let mut cursor = WaveCursor::default();
         let mut seen = Vec::new();
         let mut wave_count = 0;

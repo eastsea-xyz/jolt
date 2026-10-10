@@ -801,8 +801,8 @@ mod tests {
     use crate::metal::solinas::BooleanityRow;
     use jolt_field::Ring as _;
 
-    fn allocated_bytes(buffer: &Option<Buffer>) -> u64 {
-        buffer.as_ref().map_or(0, |buffer| buffer.length())
+    fn allocated_bytes(buffer: Option<&Buffer>) -> u64 {
+        buffer.map_or(0, |buffer| buffer.length())
     }
 
     fn next(seed: &mut u64) -> u64 {
@@ -983,7 +983,7 @@ mod tests {
                 assert!(sequence.dense_b.is_none());
                 assert!(sequence.destination().is_err());
                 assert_eq!(
-                    allocated_bytes(&sequence.dense_b),
+                    allocated_bytes(sequence.dense_b.as_ref()),
                     0,
                     "the second slab must be absent while resident row factors are live"
                 );
@@ -1000,7 +1000,7 @@ mod tests {
             assert!(sequence.finish_bind(AkitaField::one()).is_err());
             assert_eq!(sequence.current_elements(), elements);
             if expect_lazy_allocation {
-                assert_eq!(allocated_bytes(&sequence.dense_b), 0);
+                assert_eq!(allocated_bytes(sequence.dense_b.as_ref()), 0);
             }
             let mut challenges = (0..log_t)
                 .map(|_| random_field(&mut seed))
@@ -1012,9 +1012,9 @@ mod tests {
             }
             let mut expected = initial.clone();
             for (bind_index, challenge) in challenges.iter().take(log_t - 1).enumerate() {
-                let had_second_slab = allocated_bytes(&sequence.dense_b) != 0;
+                let had_second_slab = allocated_bytes(sequence.dense_b.as_ref()) != 0;
                 let before_capacity =
-                    sequence.dense_a.length() + allocated_bytes(&sequence.dense_b);
+                    sequence.dense_a.length() + allocated_bytes(sequence.dense_b.as_ref());
                 let active_source = (sequence.phase == Phase::Dense).then(|| {
                     (
                         sequence.source().unwrap().contents(),
@@ -1023,7 +1023,8 @@ mod tests {
                 });
                 expected = bind(&expected, *challenge);
                 let values = sequence.bind_and_message(*challenge).unwrap();
-                let after_capacity = sequence.dense_a.length() + allocated_bytes(&sequence.dense_b);
+                let after_capacity =
+                    sequence.dense_a.length() + allocated_bytes(sequence.dense_b.as_ref());
                 if had_second_slab && after_capacity < before_capacity {
                     capacity_decreases += 1;
                 }
@@ -1047,20 +1048,20 @@ mod tests {
                     assert!(sequence.row_buffers.is_none());
                     assert!(sequence.dense_b.is_none());
                     assert!(sequence.destination().is_err());
-                    assert_eq!(allocated_bytes(&sequence.dense_b), 0);
+                    assert_eq!(allocated_bytes(sequence.dense_b.as_ref()), 0);
                     assert!(sequence.trim_dense_destination(usize::MAX).is_err());
                     assert_eq!(sequence.phase, Phase::Dense);
-                    assert_eq!(allocated_bytes(&sequence.dense_b), 0);
+                    assert_eq!(allocated_bytes(sequence.dense_b.as_ref()), 0);
                 } else if expect_lazy_allocation && bind_index == 1 {
                     assert_eq!(
-                        allocated_bytes(&sequence.dense_b),
+                        allocated_bytes(sequence.dense_b.as_ref()),
                         byte_length((ra_count + 3) * elements / 4).unwrap()
                     );
                 }
                 if sequence.current_elements() > 2 {
                     let capacities = [
                         sequence.dense_a.length(),
-                        allocated_bytes(&sequence.dense_b),
+                        allocated_bytes(sequence.dense_b.as_ref()),
                     ];
                     if expect_shrink {
                         assert!(sequence.trim_dense_destination(usize::MAX).is_err());
@@ -1068,7 +1069,7 @@ mod tests {
                         assert_eq!(
                             [
                                 sequence.dense_a.length(),
-                                allocated_bytes(&sequence.dense_b)
+                                allocated_bytes(sequence.dense_b.as_ref())
                             ],
                             capacities
                         );
@@ -1077,7 +1078,7 @@ mod tests {
                     assert_eq!(
                         [
                             sequence.dense_a.length(),
-                            allocated_bytes(&sequence.dense_b)
+                            allocated_bytes(sequence.dense_b.as_ref())
                         ],
                         capacities
                     );
@@ -1111,10 +1112,10 @@ mod tests {
             }
             let terminal = sequence.finish_bind(challenges[log_t - 1]).unwrap();
             if expect_lazy_allocation {
-                assert!(allocated_bytes(&sequence.dense_b) > 0);
+                assert!(allocated_bytes(sequence.dense_b.as_ref()) > 0);
                 if elements == 4 {
                     assert_eq!(
-                        allocated_bytes(&sequence.dense_b),
+                        allocated_bytes(sequence.dense_b.as_ref()),
                         byte_length(ra_count + 3).unwrap()
                     );
                 }
