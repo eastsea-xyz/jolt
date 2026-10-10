@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex, PoisonError,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use jolt_kernels::profiling_memory::{MemoryProbe, MemorySnapshot};
@@ -129,6 +129,10 @@ pub struct ProfileStage {
 
 #[derive(Debug, Serialize)]
 pub struct ProofProfile {
+    /// Approximate wall-clock origin for correlating external allocation logs.
+    pub profile_started_unix_seconds: f64,
+    /// Actual sampled gauges in chronological order; values overlap on unified memory.
+    pub memory_timeline: Vec<ProfileMemorySample>,
     pub schema_version: u32,
     pub total: ProfileMetrics,
     /// Completed Metal intervals in host mach-time seconds, [start, end].
@@ -138,6 +142,14 @@ pub struct ProofProfile {
     pub memory: ProofProfileMemory,
     pub stages: Vec<ProfileStage>,
     pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProfileMemorySample {
+    pub wall_seconds: f64,
+    pub rss_bytes: Option<u64>,
+    pub physical_footprint_bytes: Option<u64>,
+    pub metal_allocated_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -226,13 +238,28 @@ impl ActiveProfile {
             .memory
             .as_ref()
             .is_some_and(|sampler| sampler.worker.is_some());
-        let memory_index = self
-            .memory
-            .take()
-            .map_or_else(MemoryIndex::default, |sampler| {
-                sampler.capture_at(end.wall);
-                MemoryIndex::new(sampler.finish())
-            });
+        let mut samples = self.memory.take().map_or_else(Vec::new, |sampler| {
+            sampler.capture_at(end.wall);
+            sampler.finish()
+        });
+        samples.sort_unstable_by_key(|sample| sample.wall);
+        let profile_started_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |duration| duration.as_secs_f64())
+            - self.start.wall.elapsed().as_secs_f64();
+        let memory_timeline = samples
+            .iter()
+            .map(|sample| ProfileMemorySample {
+                wall_seconds: sample
+                    .wall
+                    .saturating_duration_since(self.start.wall)
+                    .as_secs_f64(),
+                rss_bytes: sample.snapshot.rss_bytes,
+                physical_footprint_bytes: sample.snapshot.physical_footprint_bytes,
+                metal_allocated_bytes: sample.snapshot.metal_allocated_bytes,
+            })
+            .collect();
+        let memory_index = MemoryIndex::new(samples);
         let proof_memory = memory_index.range(self.start.wall, end.wall);
         let mut stages: Vec<ProfileStage> = self
             .stages
@@ -304,6 +331,8 @@ impl ActiveProfile {
                 .collect();
         }
         ProofProfile {
+            profile_started_unix_seconds,
+            memory_timeline,
             schema_version: 1,
             total,
             gpu_command_buffer_intervals,

@@ -67,7 +67,8 @@ const DIRECT_COOPERATIVE_HIGH_ROUTE_WORK_ITEMS_MIN: usize = 256;
 const DIRECT_COOPERATIVE_WORK_ITEMS_PER_GROUP: usize = REGISTERS_READ_WRITE_THREADS / 8;
 const STATE_TILE_BLOCKS: usize = REGISTERS_READ_WRITE_THREADS;
 const PRIVATE_PAYLOAD_POOL_THRESHOLD_BYTES: u64 = 1;
-const PRIVATE_PAYLOAD_POOL_CAP_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+// Retired large slabs must not accumulate alongside the next sumcheck stage.
+const PRIVATE_PAYLOAD_POOL_CAP_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(any(test, feature = "test-utils"))]
 const SOURCE_PRIMER_PAGE_BYTES: usize = 16 * 1024;
 #[cfg(any(test, feature = "test-utils"))]
@@ -4418,6 +4419,7 @@ fn new_buffer<T>(
     Ok(context.device.new_buffer(bytes, options))
 }
 
+#[track_caller]
 fn new_private_payload_buffer<T>(
     context: &SolinasMetal,
     elements: usize,
@@ -4427,6 +4429,7 @@ fn new_private_payload_buffer<T>(
     new_private_payload_byte_buffer(context, elements, size_of::<T>(), options, pool_epoch)
 }
 
+#[track_caller]
 fn new_private_payload_byte_buffer(
     context: &SolinasMetal,
     elements: usize,
@@ -4504,6 +4507,39 @@ mod tests {
     use jolt_witness::RowSource as _;
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
+
+    #[test]
+    fn oversized_retired_register_payloads_are_released_instead_of_cached() {
+        let context = SolinasMetal::for_akita().unwrap();
+        let epoch = context
+            .begin_private_buffer_pool_epoch((16, 4), PRIVATE_PAYLOAD_POOL_CAP_BYTES)
+            .unwrap();
+        let bytes = 128 * 1024 * 1024;
+        let retired = new_private_payload_byte_buffer(
+            &context,
+            bytes,
+            1,
+            MTLResourceOptions::StorageModePrivate,
+            epoch,
+        )
+        .unwrap();
+        let active_alias = (*retired).clone();
+        drop(retired);
+        let replacement = new_private_payload_byte_buffer(
+            &context,
+            bytes,
+            1,
+            MTLResourceOptions::StorageModePrivate,
+            epoch,
+        )
+        .unwrap();
+        assert!(
+            !replacement.was_reused(),
+            "an oversized retired payload survived the pool cap"
+        );
+        assert_eq!(active_alias.length(), bytes as u64);
+        assert_eq!(replacement.length(), bytes as u64);
+    }
 
     #[test]
     fn banks_preserve_global_increments_across_63_64_and_extreme_values() {

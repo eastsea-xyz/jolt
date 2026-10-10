@@ -43,6 +43,7 @@ macro_rules! ref_field_getters {
 mod address_raf;
 mod address_sequence;
 mod address_suffix_full;
+mod allocation_profile;
 mod booleanity;
 mod booleanity_address;
 mod bytecode_cycle;

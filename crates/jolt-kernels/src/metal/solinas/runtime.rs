@@ -39,6 +39,14 @@ struct PrivateBufferPool {
     free: Vec<Buffer>,
 }
 
+impl Drop for PrivateBufferPool {
+    fn drop(&mut self) {
+        for buffer in &self.free {
+            super::allocation_profile::record("release", buffer, Some("pool_drop"));
+        }
+    }
+}
+
 pub(super) struct PooledPrivateBuffer {
     buffer: Buffer,
     pool: PrivateBufferPoolHandle,
@@ -64,17 +72,25 @@ impl Deref for PooledPrivateBuffer {
 impl Drop for PooledPrivateBuffer {
     fn drop(&mut self) {
         if !self.reusable {
+            super::allocation_profile::record("release", &self.buffer, Some("not_reusable"));
             return;
         }
         let bytes = self.buffer.length();
         let Ok(mut pool) = self.pool.lock() else {
+            super::allocation_profile::record("release", &self.buffer, Some("pool_poisoned"));
             return;
         };
-        if pool.epoch != self.epoch || pool.free_bytes.saturating_add(bytes) > pool.cap_bytes {
+        if pool.epoch != self.epoch {
+            super::allocation_profile::record("evict", &self.buffer, Some("pool_epoch"));
+            return;
+        }
+        if pool.free_bytes.saturating_add(bytes) > pool.cap_bytes {
+            super::allocation_profile::record("evict", &self.buffer, Some("pool_cap"));
             return;
         }
         pool.free_bytes += bytes;
         pool.free.push(self.buffer.clone());
+        super::allocation_profile::record("recycle", &self.buffer, None);
     }
 }
 
@@ -213,6 +229,7 @@ impl SolinasMetal {
             return Err(MetalError::InvalidOffset);
         }
         let device = Device::system_default().ok_or(MetalError::DeviceUnavailable)?;
+        super::allocation_profile::start();
         super::hang_watchdog::start(&device);
         let options = CompileOptions::new();
         let library = {
@@ -275,6 +292,7 @@ impl SolinasMetal {
         Ok((buffer, false))
     }
 
+    #[track_caller]
     pub(super) fn begin_private_buffer_pool_epoch(
         &self,
         shape: (usize, usize),
@@ -285,6 +303,9 @@ impl SolinasMetal {
             .lock()
             .map_err(|_| MetalError::PrivateBufferPoolPoisoned)?;
         if pool.shape != Some(shape) {
+            for buffer in &pool.free {
+                super::allocation_profile::record("evict", buffer, Some("shape_change"));
+            }
             pool.free.clear();
             pool.free_bytes = 0;
             pool.shape = Some(shape);
@@ -294,6 +315,7 @@ impl SolinasMetal {
         Ok(pool.epoch)
     }
 
+    #[track_caller]
     pub(super) fn new_pooled_private_buffer(
         &self,
         bytes: u64,
@@ -329,8 +351,10 @@ impl SolinasMetal {
             None
         };
         let reused = buffer.is_some();
+        let buffer = buffer.unwrap_or_else(|| self.device.new_buffer(bytes, options));
+        super::allocation_profile::record(if reused { "reuse" } else { "allocate" }, &buffer, None);
         Ok(PooledPrivateBuffer {
-            buffer: buffer.unwrap_or_else(|| self.device.new_buffer(bytes, options)),
+            buffer,
             pool: Arc::clone(&self.private_buffer_pool),
             epoch,
             reusable,
