@@ -15,6 +15,43 @@ struct InstructionRaMaterializeParams {
     uint reserved;
 };
 
+struct InstructionRaWeightPrefixParams {
+    uint source_offset;
+    uint destination_offset;
+    uint destination_elements;
+    uint reserved;
+};
+
+// Every shorter Eq prefix is the sum of adjacent entries in its predecessor.
+// Packed levels do not overlap, so every lane can prepare one prefix entry.
+kernel void solinas_instruction_ra_weight_prefix(
+    device SolinasFp128* weights [[buffer(0)]],
+    constant InstructionRaWeightPrefixParams& params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.destination_elements) {
+        return;
+    }
+    uint source = params.source_offset + 2u * gid;
+    weights[params.destination_offset + gid] =
+        solinas_add(weights[source], weights[source + 1u]);
+}
+
+kernel void solinas_instruction_ra_bind_terminal(
+    device const SolinasFp128* tables [[buffer(0)]],
+    device SolinasFp128* claims [[buffer(1)]],
+    constant SolinasFp128& challenge [[buffer(2)]],
+    constant uint& factor_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= factor_count) {
+        return;
+    }
+    SolinasFp128 lo = tables[2u * gid];
+    SolinasFp128 hi = tables[2u * gid + 1u];
+    claims[gid] = solinas_add(lo, solinas_mul_wide(challenge, solinas_sub(hi, lo)));
+}
+
 constant uint instruction_ra_wide_branch_width [[function_constant(0)]];
 
 inline uint instruction_ra_sequence_selector(

@@ -162,20 +162,34 @@ impl<F: JoltField> InstructionRaInitialization<F> {
         committed_chunk_bits: usize,
         gamma: F,
     ) -> Result<Self, KernelError<F>> {
-        let num_committed = num_virtual * num_committed_per_virtual;
-        let chunks = committed_address_chunks(instruction_address, committed_chunk_bits);
-        if chunks.len() != num_committed
-            || instruction_address.len() != num_committed * committed_chunk_bits
-        {
-            return Err(KernelError::InvariantViolation {
-                reason: "instruction address chunk count disagrees with the committed RA count",
-            });
-        }
         if committed_chunk_bits == 0 || committed_chunk_bits > 32 {
             return Err(KernelError::Unsupported {
                 reason: "committed RA chunk width outside the supported one-hot range",
             });
         }
+        let num_committed = num_virtual
+            .checked_mul(num_committed_per_virtual)
+            .filter(|count| *count > 0)
+            .ok_or(KernelError::InvariantViolation {
+                reason: "instruction RA committed factor count overflow or zero",
+            })?;
+        let address_bits = num_committed
+            .checked_mul(committed_chunk_bits)
+            .filter(|bits| *bits <= 128)
+            .ok_or(KernelError::Unsupported {
+                reason: "instruction RA chunks exceed the 128-bit lookup domain",
+            })?;
+        if instruction_address.len() != address_bits {
+            return Err(KernelError::InvariantViolation {
+                reason: "instruction address chunk count disagrees with the committed RA count",
+            });
+        }
+        if log_t >= usize::BITS as usize {
+            return Err(KernelError::Unsupported {
+                reason: "instruction RA trace length exceeds the host address width",
+            });
+        }
+        let chunks = committed_address_chunks(instruction_address, committed_chunk_bits);
         if instruction_read_raf_cycle.len() != log_t {
             return Err(KernelError::TableSizeMismatch {
                 table: "instruction read-RAF cycle point".to_owned(),
@@ -335,6 +349,39 @@ pub struct OptimizedInstructionRaVirtualizationKernel<F: JoltField> {
 }
 
 impl<F: JoltField> OptimizedInstructionRaVirtualizationKernel<F> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(crate) fn metal_validate_round(
+        &self,
+        has_bind: bool,
+        round: usize,
+    ) -> Result<(), SumcheckError<F>> {
+        let expected_bound = if has_bind && round > 0 {
+            round - 1
+        } else if !has_bind && round == 0 {
+            0
+        } else {
+            return Err(instruction_ra_state_error(
+                "instruction RA bind does not match its round",
+            ));
+        };
+        if round >= self.progress.total() || self.progress.bound() != expected_bound {
+            return Err(instruction_ra_state_error(
+                "instruction RA rounds arrived out of order",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(crate) fn metal_validate_final_bind(&self) -> Result<(), SumcheckError<F>> {
+        if self.progress.bound().checked_add(1) != Some(self.progress.total()) {
+            return Err(instruction_ra_state_error(
+                "instruction RA final bind arrived out of order",
+            ));
+        }
+        Ok(())
+    }
+
     #[expect(clippy::too_many_arguments, reason = "mirrors the relation accessors")]
     pub(crate) fn new(
         log_t: usize,
@@ -987,5 +1034,70 @@ mod tests {
     #[test]
     fn parity_with_carried_session_rows() {
         assert_parity(4, 8, 4, 4, 42, true);
+    }
+
+    #[test]
+    fn malformed_chunk_geometry_is_rejected_before_table_preparation() {
+        for bits in [0, 33] {
+            assert!(matches!(
+                super::InstructionRaInitialization::new(7, 8, 4, &[], &[fr(3); 7], bits, fr(5)),
+                Err(crate::KernelError::Unsupported { .. })
+            ));
+        }
+        assert!(matches!(
+            super::InstructionRaInitialization::new(7, usize::MAX, 4, &[], &[fr(3); 7], 4, fr(5)),
+            Err(crate::KernelError::InvariantViolation { .. })
+        ));
+        assert!(matches!(
+            super::InstructionRaInitialization::new(7, 9, 4, &[], &[fr(3); 7], 4, fr(5)),
+            Err(crate::KernelError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            super::InstructionRaInitialization::new(7, 8, 4, &[fr(3); 127], &[fr(3); 7], 4, fr(5)),
+            Err(crate::KernelError::InvariantViolation { .. })
+        ));
+        assert!(matches!(
+            super::InstructionRaInitialization::new(
+                usize::BITS as usize,
+                8,
+                4,
+                &[fr(3); 128],
+                &[],
+                4,
+                fr(5)
+            ),
+            Err(crate::KernelError::Unsupported { .. })
+        ));
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_shape_admission_is_exact_before_offloading() {
+        for (groups, per_virtual, bits, supported) in [
+            (8, 4, 4, true),
+            (4, 4, 8, true),
+            (4, 4, 4, false),
+            (16, 2, 4, false),
+            (8, 2, 8, false),
+        ] {
+            let address = vec![fr(3); groups * per_virtual * bits];
+            let initialization = super::InstructionRaInitialization::new(
+                7,
+                groups,
+                per_virtual,
+                &address,
+                &[fr(7); 7],
+                bits,
+                fr(5),
+            )
+            .unwrap();
+            assert_eq!(initialization.supports_metal_sequence(), supported);
+            if !supported {
+                assert!(matches!(
+                    initialization.into_offloaded(),
+                    Err(crate::KernelError::Unsupported { .. })
+                ));
+            }
+        }
     }
 }

@@ -167,12 +167,20 @@ where
         // owning stage or used as causal CPU attribution.
         let profile = crate::telemetry::asynchronous_stage(self.round_profile);
         profile.metadata("round", round.to_string());
+        profile.metadata(
+            "execution_domain",
+            format!("{:?}", self.inner.execution_domain()),
+        );
         let _guard = (self.round_span)().entered();
         crate::driver::__stage_member!(pooled self.inner.prove_round(bind, round, previous_claim))
     }
 
     fn finish_rounds(&mut self, bind: F) -> Result<(), SumcheckError<F>> {
-        let _profile = crate::telemetry::asynchronous_stage(self.finish_profile);
+        let profile = crate::telemetry::asynchronous_stage(self.finish_profile);
+        profile.metadata(
+            "execution_domain",
+            format!("{:?}", self.inner.execution_domain()),
+        );
         let _guard = (self.finish_span)().entered();
         crate::driver::__stage_member!(pooled self.inner.finish_rounds(bind))
     }
@@ -775,6 +783,9 @@ mod tests {
         }
         assert_eq!(children[0].metadata["round"], "0");
         assert_eq!(children[1].metadata["round"], "3");
+        assert_eq!(children[0].metadata["execution_domain"], "Accelerator");
+        assert_eq!(children[1].metadata["execution_domain"], "Host");
+        assert_eq!(children[2].metadata["execution_domain"], "Host");
         assert_eq!(children[2].name, "sumcheck.member.TestDomainWrapper.finish");
         Ok(())
     }
