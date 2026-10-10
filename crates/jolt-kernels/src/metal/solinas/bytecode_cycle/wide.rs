@@ -89,7 +89,7 @@ pub(crate) struct BytecodeCycleWideSequence {
     reduction_limits: PipelineLimits,
     row_buffers: Option<RowBuffers>,
     dense_a: Buffer,
-    dense_b: Buffer,
+    dense_b: Option<Buffer>,
     #[cfg(test)]
     dense_trim_min_bytes: u64,
     partial_a: Buffer,
@@ -341,7 +341,9 @@ impl SolinasMetal {
                 ra: buffer_from_slice(&self.device, &ra),
             }),
             dense_a: new_buffer(dense_a_elements)?,
-            dense_b: new_buffer(dense_b_elements)?,
+            // The first row bind writes only dense_a. Allocate dense_b after
+            // those row resources are released, at its first exact output size.
+            dense_b: None,
             #[cfg(test)]
             dense_trim_min_bytes: DENSE_TRIM_MIN_BYTES,
             partial_a: new_buffer(partial_elements)?,
@@ -416,12 +418,18 @@ impl BytecodeCycleWideSequence {
                 "wide bytecode final bind requires exactly two dense entries",
             ));
         }
+        // T4 reaches the terminal bind without a dense transition.
+        if self.source_in_a && self.dense_b.is_none() {
+            self.trim_dense_destination(1)?;
+        }
+        let source = self.source()?;
+        let destination = self.destination()?;
         let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipelines.terminal_bind);
-            encoder.set_buffer(0, Some(self.source()), 0);
-            encoder.set_buffer(1, Some(self.destination()), 0);
+            encoder.set_buffer(0, Some(source), 0);
+            encoder.set_buffer(1, Some(destination), 0);
             set_inline_bytes(encoder, 2, &Fp128::from_jolt_field(&challenge));
             set_inline_bytes(encoder, 3, &self.params);
             Self::dispatch(encoder, 1, SIMD_WIDTH);
@@ -434,8 +442,9 @@ impl BytecodeCycleWideSequence {
         let tables = self.params.ra_count as usize + 3;
         // SAFETY: the terminal command has completed and writes exactly one
         // canonical field per factor into the preallocated destination slab.
-        let values =
-            unsafe { slice::from_raw_parts(self.destination().contents().cast::<Fp128>(), tables) };
+        let values = unsafe {
+            slice::from_raw_parts(self.destination()?.contents().cast::<Fp128>(), tables)
+        };
         self.context
             .validate_inputs("wide bytecode terminal factors", values)?;
         let terminal = values.iter().map(|value| value.into_jolt_field()).collect();
@@ -480,7 +489,7 @@ impl BytecodeCycleWideSequence {
         // initialized planes of current_elements canonical fields.
         let values = unsafe {
             slice::from_raw_parts(
-                self.source().contents().cast::<Fp128>(),
+                self.source()?.contents().cast::<Fp128>(),
                 tables * self.current_elements,
             )
         };
@@ -597,8 +606,8 @@ impl BytecodeCycleWideSequence {
         let final_in_a = autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipelines.transition);
-            encoder.set_buffer(0, Some(self.source()), 0);
-            encoder.set_buffer(1, Some(self.destination()), 0);
+            encoder.set_buffer(0, Some(self.source()?), 0);
+            encoder.set_buffer(1, Some(self.destination()?), 0);
             encoder.set_buffer(2, Some(&self.partial_a), 0);
             set_inline_bytes(encoder, 3, &Fp128::from_jolt_field(&challenge));
             set_inline_bytes(encoder, 4, &params);
@@ -632,7 +641,26 @@ impl BytecodeCycleWideSequence {
             .ok_or(MetalError::InputTooLong(output_elements))?;
         let required_bytes = byte_length(fields)?;
         self.context.validate_buffer_length(required_bytes)?;
-        let old_bytes = self.destination().length();
+        let _ = self.source()?;
+        if self.source_in_a && self.dense_b.is_none() {
+            if self.row_buffers.is_some() {
+                return Err(MetalError::InvalidBytecodeCycleState(
+                    "wide bytecode scratch requires the completed row bind",
+                ));
+            }
+            // Reap the completed row command's resource retains before the
+            // deferred working-set check and allocation. No extra GPU wait.
+            let _ = crate::metal::profiling::snapshot();
+            self.context
+                .validate_additional_working_set(required_bytes)?;
+            let replacement = self
+                .context
+                .device
+                .new_buffer(required_bytes, MTLResourceOptions::StorageModeShared);
+            self.dense_b = Some(replacement);
+            return Ok(());
+        }
+        let old_bytes = self.destination()?.length();
         #[cfg(not(test))]
         let minimum_bytes = DENSE_TRIM_MIN_BYTES;
         #[cfg(test)]
@@ -658,9 +686,9 @@ impl BytecodeCycleWideSequence {
         self.phase = Phase::Poisoned;
         let placeholder = self.partial_a.clone();
         let retired = if self.source_in_a {
-            std::mem::replace(&mut self.dense_b, placeholder)
+            self.dense_b.replace(placeholder)
         } else {
-            std::mem::replace(&mut self.dense_a, placeholder)
+            Some(std::mem::replace(&mut self.dense_a, placeholder))
         };
         drop(retired);
         let replacement = self
@@ -668,7 +696,7 @@ impl BytecodeCycleWideSequence {
             .device
             .new_buffer(required_bytes, MTLResourceOptions::StorageModeShared);
         if self.source_in_a {
-            self.dense_b = replacement;
+            self.dense_b = Some(replacement);
         } else {
             self.dense_a = replacement;
         }
@@ -738,19 +766,27 @@ impl BytecodeCycleWideSequence {
         Ok(message)
     }
 
-    fn source(&self) -> &Buffer {
+    fn source(&self) -> Result<&Buffer, MetalError> {
         if self.source_in_a {
-            &self.dense_a
+            Ok(&self.dense_a)
         } else {
-            &self.dense_b
+            self.dense_b
+                .as_ref()
+                .ok_or(MetalError::InvalidBytecodeCycleState(
+                    "wide bytecode dense source is absent",
+                ))
         }
     }
 
-    fn destination(&self) -> &Buffer {
+    fn destination(&self) -> Result<&Buffer, MetalError> {
         if self.source_in_a {
-            &self.dense_b
+            self.dense_b
+                .as_ref()
+                .ok_or(MetalError::InvalidBytecodeCycleState(
+                    "wide bytecode dense destination is absent",
+                ))
         } else {
-            &self.dense_a
+            Ok(&self.dense_a)
         }
     }
 }
@@ -764,6 +800,10 @@ mod tests {
     use super::*;
     use crate::metal::solinas::BooleanityRow;
     use jolt_field::Ring as _;
+
+    fn allocated_bytes(buffer: &Option<Buffer>) -> u64 {
+        buffer.as_ref().map_or(0, |buffer| buffer.length())
+    }
 
     fn next(seed: &mut u64) -> u64 {
         *seed ^= *seed << 13;
@@ -808,15 +848,24 @@ mod tests {
 
     #[test]
     fn random_wide_chunk_sequences_match_every_message_bind_and_terminal_evaluation() {
-        check_random_wide_sequences(DENSE_TRIM_MIN_BYTES, false);
+        check_random_wide_sequences(DENSE_TRIM_MIN_BYTES, false, false);
     }
 
     #[test]
     fn shrinking_inactive_wide_slabs_preserves_all_rounds_sources_and_terminal_values() {
-        check_random_wide_sequences(4 * 1024, true);
+        check_random_wide_sequences(4 * 1024, true, false);
     }
 
-    fn check_random_wide_sequences(minimum_trim_bytes: u64, expect_shrink: bool) {
+    #[test]
+    fn second_wide_slab_is_allocated_after_row_bind_and_preserves_every_round() {
+        check_random_wide_sequences(DENSE_TRIM_MIN_BYTES, false, true);
+    }
+
+    fn check_random_wide_sequences(
+        minimum_trim_bytes: u64,
+        expect_shrink: bool,
+        expect_lazy_allocation: bool,
+    ) {
         let context = SolinasMetal::for_akita().unwrap();
         let mut capacity_decreases = 0;
         let mut seed = 0xfe65_7150_3020_a1bdu64;
@@ -836,6 +885,9 @@ mod tests {
             (6, 29, 4, 2, 32),
         ] {
             if expect_shrink && log_t != 12 {
+                continue;
+            }
+            if expect_lazy_allocation && !matches!((log_t, log_k, chunk_bits), (2 | 3 | 6, 21, 4)) {
                 continue;
             }
             let elements = 1usize << log_t;
@@ -927,6 +979,15 @@ mod tests {
                 )
                 .unwrap();
             sequence.dense_trim_min_bytes = minimum_trim_bytes;
+            if expect_lazy_allocation {
+                assert!(sequence.dense_b.is_none());
+                assert!(sequence.destination().is_err());
+                assert_eq!(
+                    allocated_bytes(&sequence.dense_b),
+                    0,
+                    "the second slab must be absent while resident row factors are live"
+                );
+            }
             assert!(sequence.bind_and_message(AkitaField::one()).is_err());
             assert!(sequence.finish_bind(AkitaField::one()).is_err());
             assert_eq!(sequence.current_elements(), elements);
@@ -938,6 +999,9 @@ mod tests {
             assert!(sequence.message().is_err());
             assert!(sequence.finish_bind(AkitaField::one()).is_err());
             assert_eq!(sequence.current_elements(), elements);
+            if expect_lazy_allocation {
+                assert_eq!(allocated_bytes(&sequence.dense_b), 0);
+            }
             let mut challenges = (0..log_t)
                 .map(|_| random_field(&mut seed))
                 .collect::<Vec<_>>();
@@ -947,19 +1011,25 @@ mod tests {
                 *challenge = -AkitaField::one();
             }
             let mut expected = initial.clone();
-            for challenge in challenges.iter().take(log_t - 1) {
-                let before_capacity = sequence.dense_a.length() + sequence.dense_b.length();
-                let active_source = (sequence.phase == Phase::Dense)
-                    .then(|| (sequence.source().contents(), sequence.source().length()));
+            for (bind_index, challenge) in challenges.iter().take(log_t - 1).enumerate() {
+                let had_second_slab = allocated_bytes(&sequence.dense_b) != 0;
+                let before_capacity =
+                    sequence.dense_a.length() + allocated_bytes(&sequence.dense_b);
+                let active_source = (sequence.phase == Phase::Dense).then(|| {
+                    (
+                        sequence.source().unwrap().contents(),
+                        sequence.source().unwrap().length(),
+                    )
+                });
                 expected = bind(&expected, *challenge);
                 let values = sequence.bind_and_message(*challenge).unwrap();
-                let after_capacity = sequence.dense_a.length() + sequence.dense_b.length();
-                if after_capacity < before_capacity {
+                let after_capacity = sequence.dense_a.length() + allocated_bytes(&sequence.dense_b);
+                if had_second_slab && after_capacity < before_capacity {
                     capacity_decreases += 1;
                 }
                 if let Some((active_pointer, active_bytes)) = active_source {
-                    assert_eq!(sequence.destination().contents(), active_pointer);
-                    assert_eq!(sequence.destination().length(), active_bytes);
+                    assert_eq!(sequence.destination().unwrap().contents(), active_pointer);
+                    assert_eq!(sequence.destination().unwrap().length(), active_bytes);
                 }
                 assert_eq!(
                     &values[..samples],
@@ -973,19 +1043,42 @@ mod tests {
                     actual, expected,
                     "resident bind logK={log_k}, chunk={chunk_bits}"
                 );
+                if expect_lazy_allocation && bind_index == 0 {
+                    assert!(sequence.row_buffers.is_none());
+                    assert!(sequence.dense_b.is_none());
+                    assert!(sequence.destination().is_err());
+                    assert_eq!(allocated_bytes(&sequence.dense_b), 0);
+                    assert!(sequence.trim_dense_destination(usize::MAX).is_err());
+                    assert_eq!(sequence.phase, Phase::Dense);
+                    assert_eq!(allocated_bytes(&sequence.dense_b), 0);
+                } else if expect_lazy_allocation && bind_index == 1 {
+                    assert_eq!(
+                        allocated_bytes(&sequence.dense_b),
+                        byte_length((ra_count + 3) * elements / 4).unwrap()
+                    );
+                }
                 if sequence.current_elements() > 2 {
-                    let capacities = [sequence.dense_a.length(), sequence.dense_b.length()];
+                    let capacities = [
+                        sequence.dense_a.length(),
+                        allocated_bytes(&sequence.dense_b),
+                    ];
                     if expect_shrink {
                         assert!(sequence.trim_dense_destination(usize::MAX).is_err());
                         assert_eq!(sequence.phase, Phase::Dense);
                         assert_eq!(
-                            [sequence.dense_a.length(), sequence.dense_b.length()],
+                            [
+                                sequence.dense_a.length(),
+                                allocated_bytes(&sequence.dense_b)
+                            ],
                             capacities
                         );
                     }
                     assert!(sequence.finish_bind(AkitaField::from_u64(71)).is_err());
                     assert_eq!(
-                        [sequence.dense_a.length(), sequence.dense_b.length()],
+                        [
+                            sequence.dense_a.length(),
+                            allocated_bytes(&sequence.dense_b)
+                        ],
                         capacities
                     );
                     let mut after =
@@ -1008,16 +1101,24 @@ mod tests {
             assert_eq!(wrong_shape, before_readback);
             let final_tables = bind(&expected, challenges[log_t - 1]);
             let poison = AkitaField::from_u64(0xfee1_dead);
-            // SAFETY: all prior commands completed. This is the unused,
-            // preallocated destination slab, with room for every terminal field.
-            let destination = unsafe {
-                slice::from_raw_parts_mut(
-                    sequence.destination().contents().cast::<Fp128>(),
-                    ra_count + 3,
-                )
-            };
-            destination.fill(Fp128::from_jolt_field(&poison));
+            if let Ok(destination) = sequence.destination() {
+                // SAFETY: prior commands completed; the inactive destination
+                // has room for every terminal field. T4 allocates it at finish.
+                let values = unsafe {
+                    slice::from_raw_parts_mut(destination.contents().cast::<Fp128>(), ra_count + 3)
+                };
+                values.fill(Fp128::from_jolt_field(&poison));
+            }
             let terminal = sequence.finish_bind(challenges[log_t - 1]).unwrap();
+            if expect_lazy_allocation {
+                assert!(allocated_bytes(&sequence.dense_b) > 0);
+                if elements == 4 {
+                    assert_eq!(
+                        allocated_bytes(&sequence.dense_b),
+                        byte_length(ra_count + 3).unwrap()
+                    );
+                }
+            }
             let expected_terminal = final_tables
                 .iter()
                 .map(|plane| plane[0])
