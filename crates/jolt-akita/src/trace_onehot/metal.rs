@@ -30,8 +30,22 @@ fn packed_metal_view(
         source.one_hot_k,
         selectors.hot_entries(),
         selectors.zero_suffix_start(),
+        selectors.maximum_selector(),
     ) {
-        (256, Some(hot_entries), Some(zero_suffix_start)) => {
+        (_, Some(hot_entries), Some(zero_suffix_start), Some(maximum_selector)) => {
+            akita_metal::PackedOneHotCommitView::new_with_precomputed_metrics(
+                source.one_hot_k,
+                source.column_capacity,
+                source.num_columns,
+                selectors.row_major(),
+                selectors.active_zero_rows(),
+                selectors.zero_column_mask(),
+                hot_entries,
+                zero_suffix_start,
+                maximum_selector,
+            )
+        }
+        (256, Some(hot_entries), Some(zero_suffix_start), None) => {
             akita_metal::PackedOneHotCommitView::new_k256_with_precomputed_metrics(
                 source.column_capacity,
                 source.num_columns,
@@ -42,7 +56,7 @@ fn packed_metal_view(
                 zero_suffix_start,
             )
         }
-        (256, Some(hot_entries), None) => {
+        (256, Some(hot_entries), None, _) => {
             akita_metal::PackedOneHotCommitView::new_k256_with_precomputed_hot_entries(
                 source.column_capacity,
                 source.num_columns,

@@ -18,6 +18,7 @@ pub struct TracePackedSelectors<'a> {
     zero_column_mask: u64,
     hot_entries: Option<usize>,
     zero_suffix_start: Option<usize>,
+    maximum_selector: Option<u8>,
 }
 
 impl<'a> TracePackedSelectors<'a> {
@@ -29,6 +30,7 @@ impl<'a> TracePackedSelectors<'a> {
             zero_column_mask,
             hot_entries: None,
             zero_suffix_start: None,
+            maximum_selector: None,
         }
     }
 
@@ -45,6 +47,7 @@ impl<'a> TracePackedSelectors<'a> {
             zero_column_mask,
             hot_entries: Some(hot_entries),
             zero_suffix_start: None,
+            maximum_selector: None,
         }
     }
 
@@ -62,6 +65,28 @@ impl<'a> TracePackedSelectors<'a> {
             zero_column_mask,
             hot_entries: Some(hot_entries),
             zero_suffix_start: Some(zero_suffix_start),
+            maximum_selector: None,
+        }
+    }
+
+    /// Reuse exact metrics certified while producing these immutable selector
+    /// bytes, including their maximum byte and the all-zero row suffix.
+    #[must_use]
+    pub fn new_with_certified_metrics(
+        row_major: &'a [u8],
+        active_zero_rows: &'a [u64],
+        zero_column_mask: u64,
+        hot_entries: usize,
+        zero_suffix_start: usize,
+        maximum_selector: u8,
+    ) -> Self {
+        Self {
+            row_major,
+            active_zero_rows,
+            zero_column_mask,
+            hot_entries: Some(hot_entries),
+            zero_suffix_start: Some(zero_suffix_start),
+            maximum_selector: Some(maximum_selector),
         }
     }
 
@@ -88,6 +113,11 @@ impl<'a> TracePackedSelectors<'a> {
     #[must_use]
     pub fn zero_suffix_start(self) -> Option<usize> {
         self.zero_suffix_start
+    }
+
+    #[must_use]
+    pub fn maximum_selector(self) -> Option<u8> {
+        self.maximum_selector
     }
 }
 
@@ -131,6 +161,24 @@ pub trait TraceOneHotRows: Send + Sync + 'static {
 #[must_use]
 pub const fn no_selected_row() -> u8 {
     NO_SELECTED_ROW
+}
+
+#[cfg(test)]
+mod selector_metrics_tests {
+    use super::TracePackedSelectors;
+
+    #[test]
+    fn only_certified_metrics_carry_a_selector_bound() {
+        let lanes = [0, 3, 15, 0];
+        let unchecked = TracePackedSelectors::new_with_precomputed_metrics(&lanes, &[], 0, 2, 2);
+        assert_eq!(unchecked.maximum_selector(), None);
+
+        let certified = TracePackedSelectors::new_with_certified_metrics(&lanes, &[], 0, 2, 2, 15);
+        assert_eq!(certified.maximum_selector(), Some(15));
+        assert_eq!(certified.hot_entries(), Some(2));
+        assert_eq!(certified.zero_suffix_start(), Some(2));
+        assert_eq!(certified.row_major().as_ptr(), lanes.as_ptr());
+    }
 }
 
 /// One physical one-hot polynomial containing all trace-derived semantic
