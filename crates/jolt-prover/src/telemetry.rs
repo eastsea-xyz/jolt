@@ -393,13 +393,14 @@ impl MemorySampler {
         let (stop, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("jolt-memory-profile".to_owned())
-            .spawn(move || loop {
-                match receiver.recv_timeout(MEMORY_SAMPLE_INTERVAL) {
-                    Err(RecvTimeoutError::Timeout) => worker_recording
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) =
+                    receiver.recv_timeout(MEMORY_SAMPLE_INTERVAL)
+                {
+                    worker_recording
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .capture_at(Instant::now()),
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        .capture_at(Instant::now());
                 }
             })
             .ok();
@@ -700,7 +701,7 @@ impl Drop for StageGuard {
         STACK.with(|stack| {
             stack
                 .borrow_mut()
-                .retain(|token| *token != (generation, id))
+                .retain(|token| *token != (generation, id));
         });
         let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(active) = active
