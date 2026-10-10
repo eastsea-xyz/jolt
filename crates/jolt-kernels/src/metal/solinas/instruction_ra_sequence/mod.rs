@@ -1371,11 +1371,7 @@ fn write_fields_at_offset(
     // command is using it while the host writes the selected prefix.
     let output = unsafe {
         slice::from_raw_parts_mut(
-            buffer
-                .contents()
-                .cast::<u8>()
-                .add(offset as usize)
-                .cast::<Fp128>(),
+            buffer.contents().cast::<Fp128>().byte_add(offset as usize),
             capacity,
         )
     };
@@ -1636,7 +1632,7 @@ mod tests {
                 // and the checked cache layout includes this active Eq table.
                 let cached = unsafe {
                     slice::from_raw_parts(
-                        buffer.contents().cast::<u8>().add(offset).cast::<Fp128>(),
+                        buffer.contents().cast::<Fp128>().byte_add(offset),
                         expected.len(),
                     )
                 };

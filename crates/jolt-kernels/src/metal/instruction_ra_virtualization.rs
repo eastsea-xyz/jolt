@@ -757,7 +757,7 @@ mod tests {
             8,
             4,
             &vec![field(31); 128],
-            &vec![field(113); 7],
+            &[field(113); 7],
             4,
             rows,
             AkitaField::zero(),
