@@ -15,6 +15,8 @@ use super::{byte_length, BytecodeCycleSequenceConfig, SIMD_WIDTH};
 const STAGES: usize = 9;
 const MAX_RA: usize = 8;
 const MAX_SAMPLES: usize = MAX_RA + 2;
+const DENSE_TRIM_MIN_BYTES: u64 = 64 * 1024 * 1024;
+const DENSE_TRIM_CAPACITY_RATIO: u64 = 4;
 const FIRST_MESSAGE: &str = "solinas_bytecode_wide_first_message";
 const BIND_ROOTS: &str = "solinas_bytecode_row_bind_lo_roots";
 const FIRST_BIND: &str = "solinas_bytecode_wide_first_bind_message";
@@ -76,6 +78,7 @@ enum Phase {
     BeforeFirstBind,
     Dense,
     Finished,
+    Poisoned,
 }
 
 /// Factors are packed in column-major slabs. The first bind creates only
@@ -87,6 +90,8 @@ pub(crate) struct BytecodeCycleWideSequence {
     row_buffers: Option<RowBuffers>,
     dense_a: Buffer,
     dense_b: Buffer,
+    #[cfg(test)]
+    dense_trim_min_bytes: u64,
     partial_a: Buffer,
     partial_b: Buffer,
     params: Params,
@@ -337,6 +342,8 @@ impl SolinasMetal {
             }),
             dense_a: new_buffer(dense_a_elements)?,
             dense_b: new_buffer(dense_b_elements)?,
+            #[cfg(test)]
+            dense_trim_min_bytes: DENSE_TRIM_MIN_BYTES,
             partial_a: new_buffer(partial_elements)?,
             partial_b: new_buffer(partial_elements)?,
             params: Params {
@@ -392,6 +399,9 @@ impl BytecodeCycleWideSequence {
             Phase::Finished => Err(MetalError::InvalidBytecodeCycleState(
                 "wide bytecode rounds are already finished",
             )),
+            Phase::Poisoned => Err(MetalError::InvalidBytecodeCycleState(
+                "wide bytecode destination replacement did not complete",
+            )),
         }
     }
 
@@ -406,7 +416,7 @@ impl BytecodeCycleWideSequence {
                 "wide bytecode final bind requires exactly two dense entries",
             ));
         }
-        let command = self.context.queue.new_command_buffer();
+        let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipelines.terminal_bind);
@@ -417,10 +427,10 @@ impl BytecodeCycleWideSequence {
             Self::dispatch(encoder, 1, SIMD_WIDTH);
             encoder.end_encoding();
             command.commit();
-            crate::metal::profiling::record_submission(command);
+            crate::metal::profiling::record_submission(&command);
             command.wait_until_completed();
         });
-        validate_completed_command(command)?;
+        validate_completed_command(&command)?;
         let tables = self.params.ra_count as usize + 3;
         // SAFETY: the terminal command has completed and writes exactly one
         // canonical field per factor into the preallocated destination slab.
@@ -497,7 +507,7 @@ impl BytecodeCycleWideSequence {
             .ok_or(MetalError::InvalidBytecodeCycleState(
                 "wide bytecode row buffers were released",
             ))?;
-        let command = self.context.queue.new_command_buffer();
+        let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         let final_in_a = autoreleasepool(|| {
             if let Some(challenge) = challenge {
                 let encoder = command.new_compute_command_encoder();
@@ -554,11 +564,11 @@ impl BytecodeCycleWideSequence {
             let final_in_a = self.encode_reductions(encoder, self.params.hi_length as usize)?;
             encoder.end_encoding();
             command.commit();
-            crate::metal::profiling::record_submission(command);
+            crate::metal::profiling::record_submission(&command);
             command.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
-        validate_completed_command(command)?;
+        validate_completed_command(&command)?;
         self.read_message(final_in_a)
     }
 
@@ -572,6 +582,7 @@ impl BytecodeCycleWideSequence {
                 got: self.current_elements,
             });
         }
+        self.trim_dense_destination(self.current_elements / 2)?;
         let pairs = self.current_elements / 4;
         let groups = self
             .max_threadgroups
@@ -582,7 +593,7 @@ impl BytecodeCycleWideSequence {
             threadgroups: groups as u32,
             ..self.params
         };
-        let command = self.context.queue.new_command_buffer();
+        let command = autoreleasepool(|| self.context.queue.new_command_buffer().to_owned());
         let final_in_a = autoreleasepool(|| {
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipelines.transition);
@@ -595,15 +606,74 @@ impl BytecodeCycleWideSequence {
             let final_in_a = self.encode_reductions(encoder, groups)?;
             encoder.end_encoding();
             command.commit();
-            crate::metal::profiling::record_submission(command);
+            crate::metal::profiling::record_submission(&command);
             command.wait_until_completed();
             Ok::<bool, MetalError>(final_in_a)
         })?;
-        validate_completed_command(command)?;
+        validate_completed_command(&command)?;
         let message = self.read_message(final_in_a)?;
         self.current_elements /= 2;
         self.source_in_a = !self.source_in_a;
         Ok(message)
+    }
+
+    fn trim_dense_destination(&mut self, output_elements: usize) -> Result<(), MetalError> {
+        if self.phase != Phase::Dense
+            || output_elements == 0
+            || output_elements != self.current_elements / 2
+        {
+            return Err(MetalError::InvalidBytecodeCycleState(
+                "wide bytecode replacement must match the next dense output",
+            ));
+        }
+        let tables = self.params.ra_count as usize + 3;
+        let fields = tables
+            .checked_mul(output_elements)
+            .ok_or(MetalError::InputTooLong(output_elements))?;
+        let required_bytes = byte_length(fields)?;
+        self.context.validate_buffer_length(required_bytes)?;
+        let old_bytes = self.destination().length();
+        #[cfg(not(test))]
+        let minimum_bytes = DENSE_TRIM_MIN_BYTES;
+        #[cfg(test)]
+        let minimum_bytes = self.dense_trim_min_bytes;
+        if old_bytes < minimum_bytes || old_bytes / DENSE_TRIM_CAPACITY_RATIO < required_bytes {
+            return Ok(());
+        }
+        // Prior rounds have completed; reap their profiling handles before
+        // releasing the inactive slab and planning its replacement.
+        let _ = crate::metal::profiling::snapshot();
+        super::super::validate_working_set(
+            self.context
+                .device
+                .current_allocated_size()
+                .saturating_sub(old_bytes),
+            required_bytes,
+            self.context.device.recommended_max_working_set_size(),
+        )?;
+
+        // No fallible operation follows the retirement. Poison the sequence
+        // during the non-fallible Metal allocation so unwinding cannot expose
+        // the temporary partial-buffer alias as a valid destination.
+        self.phase = Phase::Poisoned;
+        let placeholder = self.partial_a.clone();
+        let retired = if self.source_in_a {
+            std::mem::replace(&mut self.dense_b, placeholder)
+        } else {
+            std::mem::replace(&mut self.dense_a, placeholder)
+        };
+        drop(retired);
+        let replacement = self
+            .context
+            .device
+            .new_buffer(required_bytes, MTLResourceOptions::StorageModeShared);
+        if self.source_in_a {
+            self.dense_b = replacement;
+        } else {
+            self.dense_a = replacement;
+        }
+        self.phase = Phase::Dense;
+        Ok(())
     }
 
     fn encode_message_dispatch(
@@ -738,7 +808,17 @@ mod tests {
 
     #[test]
     fn random_wide_chunk_sequences_match_every_message_bind_and_terminal_evaluation() {
+        check_random_wide_sequences(DENSE_TRIM_MIN_BYTES, false);
+    }
+
+    #[test]
+    fn shrinking_inactive_wide_slabs_preserves_all_rounds_sources_and_terminal_values() {
+        check_random_wide_sequences(4 * 1024, true);
+    }
+
+    fn check_random_wide_sequences(minimum_trim_bytes: u64, expect_shrink: bool) {
         let context = SolinasMetal::for_akita().unwrap();
+        let mut capacity_decreases = 0;
         let mut seed = 0xfe65_7150_3020_a1bdu64;
         for (log_t, log_k, chunk_bits, max_threadgroups, threads) in [
             // The smallest admitted trace goes directly from the row bind to
@@ -755,6 +835,9 @@ mod tests {
             (6, 25, 4, 2, 32),
             (6, 29, 4, 2, 32),
         ] {
+            if expect_shrink && log_t != 12 {
+                continue;
+            }
             let elements = 1usize << log_t;
             let ra_count = log_k.div_ceil(chunk_bits);
             let addresses = 1usize << log_k;
@@ -843,6 +926,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            sequence.dense_trim_min_bytes = minimum_trim_bytes;
             assert!(sequence.bind_and_message(AkitaField::one()).is_err());
             assert!(sequence.finish_bind(AkitaField::one()).is_err());
             assert_eq!(sequence.current_elements(), elements);
@@ -864,8 +948,19 @@ mod tests {
             }
             let mut expected = initial.clone();
             for challenge in challenges.iter().take(log_t - 1) {
+                let before_capacity = sequence.dense_a.length() + sequence.dense_b.length();
+                let active_source = (sequence.phase == Phase::Dense)
+                    .then(|| (sequence.source().contents(), sequence.source().length()));
                 expected = bind(&expected, *challenge);
                 let values = sequence.bind_and_message(*challenge).unwrap();
+                let after_capacity = sequence.dense_a.length() + sequence.dense_b.length();
+                if after_capacity < before_capacity {
+                    capacity_decreases += 1;
+                }
+                if let Some((active_pointer, active_bytes)) = active_source {
+                    assert_eq!(sequence.destination().contents(), active_pointer);
+                    assert_eq!(sequence.destination().length(), active_bytes);
+                }
                 assert_eq!(
                     &values[..samples],
                     message(&expected, samples),
@@ -879,7 +974,20 @@ mod tests {
                     "resident bind logK={log_k}, chunk={chunk_bits}"
                 );
                 if sequence.current_elements() > 2 {
+                    let capacities = [sequence.dense_a.length(), sequence.dense_b.length()];
+                    if expect_shrink {
+                        assert!(sequence.trim_dense_destination(usize::MAX).is_err());
+                        assert_eq!(sequence.phase, Phase::Dense);
+                        assert_eq!(
+                            [sequence.dense_a.length(), sequence.dense_b.length()],
+                            capacities
+                        );
+                    }
                     assert!(sequence.finish_bind(AkitaField::from_u64(71)).is_err());
+                    assert_eq!(
+                        [sequence.dense_a.length(), sequence.dense_b.length()],
+                        capacities
+                    );
                     let mut after =
                         vec![vec![AkitaField::zero(); sequence.current_elements()]; ra_count + 3];
                     sequence.read_current_tables(&mut after).unwrap();
@@ -948,6 +1056,14 @@ mod tests {
                     "terminal factor oracle logK={log_k}, chunk={chunk_bits}"
                 );
             }
+        }
+        if expect_shrink {
+            assert!(
+                capacity_decreases > 0,
+                "small-threshold fixture must release inactive capacity"
+            );
+        } else {
+            assert_eq!(capacity_decreases, 0);
         }
     }
 
