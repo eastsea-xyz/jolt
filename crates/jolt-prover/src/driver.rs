@@ -137,6 +137,8 @@ pub struct SpannedRounds<K, SR, SF> {
     pub inner: K,
     pub round_span: SR,
     pub finish_span: SF,
+    pub round_profile: &'static str,
+    pub finish_profile: &'static str,
 }
 
 impl<F, K, SR, SF> ProveRounds<F> for SpannedRounds<Box<K>, SR, SF>
@@ -150,19 +152,29 @@ where
         self.inner.num_rounds()
     }
 
+    fn execution_domain(&self) -> jolt_sumcheck::RoundExecutionDomain {
+        self.inner.execution_domain()
+    }
+
     fn prove_round(
         &mut self,
         bind: Option<F>,
         round: usize,
         previous_claim: F,
     ) -> Result<UnivariatePoly<F>, SumcheckError<F>> {
+        // Host and accelerator members may run concurrently. These share the
+        // process CPU/GPU clocks, so their intervals must not be added to the
+        // owning stage or used as causal CPU attribution.
+        let profile = crate::telemetry::asynchronous_stage(self.round_profile);
+        profile.metadata("round", round.to_string());
         let _guard = (self.round_span)().entered();
-        self.inner.prove_round(bind, round, previous_claim)
+        crate::driver::__stage_member!(pooled self.inner.prove_round(bind, round, previous_claim))
     }
 
     fn finish_rounds(&mut self, bind: F) -> Result<(), SumcheckError<F>> {
+        let _profile = crate::telemetry::asynchronous_stage(self.finish_profile);
         let _guard = (self.finish_span)().entered();
-        self.inner.finish_rounds(bind)
+        crate::driver::__stage_member!(pooled self.inner.finish_rounds(bind))
     }
 }
 
@@ -329,6 +341,19 @@ where
 /// extraction. Internal to [`impl_stage_prover!`]; every local it touches is
 /// passed in by name (macro hygiene).
 macro_rules! __stage_member {
+    // Fresh Rust scheduler threads do not inherit an Objective-C pool. The
+    // full call must own it, including command creation and completion; any
+    // asynchronous work crossing this boundary retains its owned handles.
+    (pooled $call:expr) => {{
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            ::jolt_kernels::metal::autoreleasepool(|| $call)
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            $call
+        }
+    }};
     (kernel_ty required $relation:ident) => {
         ::std::boxed::Box<dyn ::jolt_kernels::SumcheckKernel<F, Relation = $relation<F>>>
     };
@@ -339,7 +364,8 @@ macro_rules! __stage_member {
     };
     (prepare required $member:ident, $relation:ident, $source:expr, $batch:expr, $session:expr, $witness:expr, $inputs:expr, $points:expr, $challenges:expr) => {
         ::tracing::info_span!(concat!(stringify!($relation), "::prepare")).in_scope(|| {
-            $crate::driver::prepare_required::<F, $relation<F>, _>(
+            let _profile = $crate::telemetry::stage(concat!("sumcheck.member.", stringify!($relation), ".prepare"));
+            $crate::driver::__stage_member!(pooled $crate::driver::prepare_required::<F, $relation<F>, _>(
                 $source,
                 &$batch.$member,
                 $session,
@@ -347,12 +373,13 @@ macro_rules! __stage_member {
                 &$inputs.$member,
                 &$points.$member,
                 &$challenges.$member,
-            )
+            ))
         })?
     };
     (prepare optional $member:ident, $relation:ident, $source:expr, $batch:expr, $session:expr, $witness:expr, $inputs:expr, $points:expr, $challenges:expr) => {
         ::tracing::info_span!(concat!(stringify!($relation), "::prepare")).in_scope(|| {
-            $crate::driver::prepare_optional::<F, $relation<F>, _>(
+            let _profile = $crate::telemetry::stage(concat!("sumcheck.member.", stringify!($relation), ".prepare"));
+            $crate::driver::__stage_member!(pooled $crate::driver::prepare_optional::<F, $relation<F>, _>(
                 $source,
                 $batch.$member.as_ref(),
                 $session,
@@ -360,7 +387,7 @@ macro_rules! __stage_member {
                 $inputs.$member.as_ref(),
                 $points.$member.as_ref(),
                 $challenges.$member.as_ref(),
-            )
+            ))
         })?
     };
     // Rebind the member's kernel inside the instrumentation-only
@@ -373,6 +400,8 @@ macro_rules! __stage_member {
             finish_span: || {
                 ::tracing::info_span!(concat!(stringify!($relation), "::finish_rounds"))
             },
+            round_profile: concat!("sumcheck.member.", stringify!($relation), ".round"),
+            finish_profile: concat!("sumcheck.member.", stringify!($relation), ".finish"),
         };
     };
     (spanned optional $member:ident, $relation:ident) => {
@@ -382,6 +411,8 @@ macro_rules! __stage_member {
             finish_span: || {
                 ::tracing::info_span!(concat!(stringify!($relation), "::finish_rounds"))
             },
+            round_profile: concat!("sumcheck.member.", stringify!($relation), ".round"),
+            finish_profile: concat!("sumcheck.member.", stringify!($relation), ".finish"),
         });
     };
     // `SumcheckKernel`'s `MaybeAllocative` supertrait is `Allocative` under
@@ -642,3 +673,109 @@ macro_rules! impl_stage_prover {
 }
 
 pub(crate) use {__stage_member, __stage_shape_check, impl_stage_prover};
+
+#[cfg(test)]
+mod tests {
+    use jolt_field::{Fr, Ring};
+    use jolt_sumcheck::RoundExecutionDomain;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct DomainKernel {
+        calls: Vec<(Option<Fr>, usize, Fr)>,
+        terminal: Option<Fr>,
+    }
+
+    impl ProveRounds<Fr> for DomainKernel {
+        fn num_rounds(&self) -> usize {
+            1
+        }
+
+        fn execution_domain(&self) -> RoundExecutionDomain {
+            if self.calls.is_empty() {
+                RoundExecutionDomain::Accelerator
+            } else {
+                RoundExecutionDomain::Host
+            }
+        }
+
+        fn prove_round(
+            &mut self,
+            bind: Option<Fr>,
+            round: usize,
+            previous_claim: Fr,
+        ) -> Result<UnivariatePoly<Fr>, SumcheckError<Fr>> {
+            self.calls.push((bind, round, previous_claim));
+            if round != 0 {
+                return Err(SumcheckError::RoundCheckFailed {
+                    round,
+                    expected: previous_claim,
+                    actual: Fr::from_u64(99),
+                });
+            }
+            Ok(UnivariatePoly::new(vec![previous_claim, Fr::from_u64(7)]))
+        }
+
+        fn finish_rounds(&mut self, bind: Fr) -> Result<(), SumcheckError<Fr>> {
+            self.terminal = Some(bind);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn member_profile_preserves_domain_transition_values_and_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        crate::telemetry::start()?;
+        let parent = crate::telemetry::stage("sumcheck.test_domain_wrapper");
+        let mut member = SpannedRounds {
+            inner: Box::new(DomainKernel::default()),
+            round_span: tracing::Span::none,
+            finish_span: tracing::Span::none,
+            round_profile: "sumcheck.member.TestDomainWrapper.round",
+            finish_profile: "sumcheck.member.TestDomainWrapper.finish",
+        };
+        assert_eq!(member.num_rounds(), 1);
+        assert_eq!(member.execution_domain(), RoundExecutionDomain::Accelerator);
+        let claim = Fr::from_u64(41);
+        let polynomial = member.prove_round(None, 0, claim)?;
+        assert_eq!(polynomial.coefficients(), &[claim, Fr::from_u64(7)]);
+        assert_eq!(member.execution_domain(), RoundExecutionDomain::Host);
+        let bind = Fr::from_u64(13);
+        assert!(matches!(
+            member.prove_round(Some(bind), 3, claim),
+            Err(SumcheckError::RoundCheckFailed { round: 3, expected, actual })
+                if expected == claim && actual == Fr::from_u64(99)
+        ));
+        member.finish_rounds(bind)?;
+        assert_eq!(
+            member.inner.calls,
+            [(None, 0, claim), (Some(bind), 3, claim)]
+        );
+        assert_eq!(member.inner.terminal, Some(bind));
+        drop(parent);
+        let profile = crate::telemetry::finish().ok_or("member profile missing")?;
+        // Telemetry is process-wide; unrelated libtest threads may also emit
+        // stages while this profile is enabled.
+        let parent_id = profile
+            .stages
+            .iter()
+            .find(|stage| stage.name == "sumcheck.test_domain_wrapper")
+            .ok_or("wrapper parent stage missing")?
+            .id;
+        let children = profile
+            .stages
+            .iter()
+            .filter(|stage| stage.name.starts_with("sumcheck.member.TestDomainWrapper."))
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 3);
+        for child in &children {
+            assert!(child.complete && child.supplement);
+            assert_eq!(child.parent_id, Some(parent_id));
+        }
+        assert_eq!(children[0].metadata["round"], "0");
+        assert_eq!(children[1].metadata["round"], "3");
+        assert_eq!(children[2].name, "sumcheck.member.TestDomainWrapper.finish");
+        Ok(())
+    }
+}

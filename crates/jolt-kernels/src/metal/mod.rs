@@ -30,6 +30,8 @@ mod spartan_product;
 mod spartan_shift;
 
 pub use backend::{MetalBackend, MetalConfig};
+// The prover owns the member-call lifetime, including scoped GPU workers.
+pub use ::metal::objc::rc::autoreleasepool;
 pub use booleanity::{BooleanityAddressMetalConfig, BooleanityMetalConfig};
 pub use bytecode_read_raf::{
     BytecodeReadRafAddressImplementation, BytecodeReadRafAddressMetalConfig,
