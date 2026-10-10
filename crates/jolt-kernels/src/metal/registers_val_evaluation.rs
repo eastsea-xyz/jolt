@@ -153,7 +153,12 @@ impl PrepareKernel<AkitaField, RegistersValEvaluation<AkitaField>> for MetalBack
         let (r_address, r_cycle) = point.split_at(REGISTER_ADDRESS_BITS);
         let split_bits = r_cycle.len() / 2;
         let split_handoff = cycles >> split_bits.saturating_sub(1);
-        let cutoff_elements = config.cutoff_elements.max(split_handoff);
+        let tail_cutoff = if log_t < 25 {
+            config.cutoff_elements.min(1 << 12)
+        } else {
+            config.cutoff_elements
+        };
+        let cutoff_elements = tail_cutoff.max(split_handoff);
 
         if resident_requested {
             let lease = session.take::<RegistersValInstructionSourceLease>().ok_or(
