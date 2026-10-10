@@ -220,6 +220,24 @@ impl<const D: usize>
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+impl<const D: usize> RootCommitKernel<GroupedRootView<'_, D>, AkitaField, D>
+    for akita_metal::MetalBackend
+{
+    fn commit_inner_group(
+        &self,
+        prepared: &Self::PreparedSetup,
+        sources: Vec<GroupedRootView<'_, D>>,
+        plan: CommitInnerPlan,
+    ) -> Result<Vec<CommitInnerWitness<AkitaField>>, AkitaError> {
+        // Opening roots arrive precommitted. The capability is also available
+        // to callers that intentionally recompute an arbitrary grouped root.
+        self.record_opening_cpu_fallback(sources.len())
+            .map_err(|error| AkitaError::InvalidInput(error.to_string()))?;
+        CpuBackend::DEFAULT.commit_inner_group(prepared.cpu_prepared(), sources, plan)
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 impl<const D: usize> OpeningFoldKernel<GroupedRootView<'_, D>, AkitaField, D>
     for akita_metal::MetalBackend
 {
