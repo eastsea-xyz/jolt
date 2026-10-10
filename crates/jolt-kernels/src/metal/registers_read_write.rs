@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, sync::Arc};
 
-use jolt_field::Prime128OffsetA7F7 as AkitaField;
+use jolt_field::{Prime128OffsetA7F7 as AkitaField, Zero as _};
 use jolt_poly::{BindingOrder, GruenSplitEqPolynomial, UnivariatePoly};
 use jolt_sumcheck::{ProveRounds, RoundExecutionDomain, SumcheckError};
 use jolt_verifier::stages::relations::{
@@ -47,7 +47,7 @@ pub struct RegistersReadWriteMetalConfig {
 impl Default for RegistersReadWriteMetalConfig {
     fn default() -> Self {
         Self {
-            trace_cutoff_elements: 1 << 25,
+            trace_cutoff_elements: 1 << 22,
         }
     }
 }
@@ -55,10 +55,10 @@ impl Default for RegistersReadWriteMetalConfig {
 type RegistersReadWriteKernelBox =
     Box<dyn SumcheckKernel<AkitaField, Relation = RegistersReadWriteChecking<AkitaField>>>;
 
-const CONCURRENT_RAM_VAL_ROUND: usize = 8;
+const METAL_OPERAND_CLAIMS_LOG_T_MIN: usize = 22;
 
 struct MetalRegistersReadWriteKernel {
-    sequence: RegistersReadWriteCycleSequence,
+    sequence: Vec<RegistersReadWriteCycleSequence>,
     source_owner: Option<Arc<AlignedPackedRegisterRows>>,
     continuation: Option<RegistersReadWriteKernelBox>,
     gruen: GruenSplitEqPolynomial<AkitaField>,
@@ -80,7 +80,10 @@ impl allocative::Allocative for MetalRegistersReadWriteKernel {
         let mut visitor = visitor.enter_self_sized::<Self>();
         visitor.visit_simple(
             allocative::Key::new("sequence"),
-            self.sequence.resident_bytes(),
+            self.sequence
+                .iter()
+                .map(RegistersReadWriteCycleSequence::resident_bytes)
+                .sum(),
         );
         visitor.visit_simple(allocative::Key::new("gruen"), gruen_heap_bytes(&self.gruen));
         visitor.visit_simple(
@@ -118,31 +121,35 @@ impl MetalRegistersReadWriteKernel {
         round: usize,
         previous_claim: AkitaField,
     ) -> Result<UnivariatePoly<AkitaField>, SumcheckError<AkitaField>> {
-        let observation = match bind {
-            Some(challenge) => {
-                self.gruen.bind(challenge);
-                self.cycle_challenges.push(challenge);
-                self.bound_challenges.push(challenge);
-                self.sequence
+        if let Some(challenge) = bind {
+            self.gruen.bind(challenge);
+            self.cycle_challenges.push(challenge);
+            self.bound_challenges.push(challenge);
+        }
+        let mut quadratic = [AkitaField::zero(); 2];
+        for (bank, sequence) in self.sequence.iter_mut().enumerate() {
+            let observation = match bind {
+                Some(challenge) => sequence
                     .bind_and_message(
                         challenge,
                         self.gruen.e_in_current(),
                         self.gruen.e_out_current(),
                     )
-                    .map_err(metal_runtime_error)?
-            }
-            None => self
-                .sequence
-                .message(
-                    self.gruen.e_in_current(),
-                    self.gruen.e_out_current(),
-                    self.gamma,
-                )
-                .map_err(metal_runtime_error)?,
-        };
-        tracing::info!(
+                    .map_err(metal_runtime_error)?,
+                None => sequence
+                    .message(
+                        self.gruen.e_in_current(),
+                        self.gruen.e_out_current(),
+                        self.gamma,
+                    )
+                    .map_err(metal_runtime_error)?,
+            };
+            quadratic[0] += observation.quadratic[0];
+            quadratic[1] += observation.quadratic[1];
+            tracing::info!(
             target: "jolt::metal",
             round,
+            bank,
             wall_ns = duration_nanos(observation.wall),
             gpu_active_ns = duration_nanos(observation.gpu_active),
             prefill_gpu_active_ns = duration_nanos(observation.prefill_gpu_active),
@@ -151,12 +158,11 @@ impl MetalRegistersReadWriteKernel {
             peak_transition_bytes = observation.peak_transition_bytes,
             retired_source_bytes = observation.retired_source_bytes,
             "completed registers read-write Metal cycle round"
-        );
-        Ok(self.gruen.gruen_poly_deg_3(
-            observation.quadratic[0],
-            observation.quadratic[1],
-            previous_claim,
-        ))
+            );
+        }
+        Ok(self
+            .gruen
+            .gruen_poly_deg_3(quadratic[0], quadratic[1], previous_claim))
     }
 
     fn enter_address_phase(
@@ -172,27 +178,38 @@ impl MetalRegistersReadWriteKernel {
         }
         self.cycle_challenges.push(challenge);
         self.bound_challenges.push(challenge);
-        let RegistersReadWriteCycleFinish {
-            roots,
-            increment,
-            wall,
-            gpu_active,
-            allocation,
-            resident_bytes,
-            peak_transition_bytes,
-        } = self
-            .sequence
-            .finish(challenge)
-            .map_err(metal_runtime_error)?;
-        tracing::info!(
+        let mut roots = Vec::new();
+        let mut shared_increment = None;
+        for (bank, sequence) in self.sequence.iter_mut().enumerate() {
+            let RegistersReadWriteCycleFinish {
+                roots: bank_roots,
+                increment: bank_increment,
+                wall,
+                gpu_active,
+                allocation,
+                resident_bytes,
+                peak_transition_bytes,
+            } = sequence.finish(challenge).map_err(metal_runtime_error)?;
+            if shared_increment.is_some_and(|increment| increment != bank_increment) {
+                return Err(metal_error(
+                    "register read-write banks disagree on the global increment",
+                ));
+            }
+            shared_increment = Some(bank_increment);
+            roots.extend(bank_roots);
+            tracing::info!(
             target: "jolt::metal",
+            bank,
             wall_ns = duration_nanos(wall),
             gpu_active_ns = duration_nanos(gpu_active),
             allocation_ns = duration_nanos(allocation),
             resident_bytes,
             peak_transition_bytes,
             "completed registers read-write Metal cycle handoff"
-        );
+            );
+        }
+        let increment = shared_increment
+            .ok_or_else(|| metal_error("registers read-write has no cycle sequence"))?;
         let operand_rows = if self.use_metal_operand_claims {
             None
         } else {
@@ -233,7 +250,7 @@ impl ProveRounds<AkitaField> for MetalRegistersReadWriteKernel {
     }
 
     fn execution_domain(&self) -> RoundExecutionDomain {
-        if self.log_t >= 28 && self.next_round == CONCURRENT_RAM_VAL_ROUND {
+        if self.next_round <= self.log_t {
             RoundExecutionDomain::Accelerator
         } else {
             RoundExecutionDomain::Host
@@ -314,6 +331,10 @@ impl SumcheckKernel<AkitaField> for MetalRegistersReadWriteKernel {
                 .collect::<Vec<_>>();
             let observation = self
                 .sequence
+                .first()
+                .ok_or(SumcheckKernelError::InvariantViolation {
+                    reason: "registers read-write lost its operand source sequence",
+                })?
                 .operand_claims(&cycle_point, &address_point)
                 .map_err(|error| SumcheckKernelError::ComputeBackend {
                     backend: "metal",
@@ -387,11 +408,14 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
             return Ok(prepared);
         }
         if let Some(capacity) = session.take::<RegisterCapacityExceeded>() {
-            return prepare_capacity_fallback(session, witness, inputs, capacity);
+            if log_t >= 25 {
+                return prepare_capacity_fallback(session, witness, inputs, capacity);
+            }
         }
         let needs_rd_carry = self.config.registers_val_evaluation.source
             != RegistersValEvaluationSource::Stage1Resident
-            || cycles < self.config.registers_val_evaluation.trace_cutoff_elements;
+            || cycles < self.config.registers_val_evaluation.trace_cutoff_elements
+            || !(26..=28).contains(&log_t);
         if log_t == 28 && !needs_rd_carry {
             let resident_source = session.state::<RegistersReadWriteStage1Source>().is_some();
             let resident_rd_post = session.state::<RegistersClaimResidentRdPlane>().is_some();
@@ -460,7 +484,7 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
                     .registers_read_write_metal_sequences
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let kernel = Box::new(MetalRegistersReadWriteKernel {
-                    sequence,
+                    sequence: vec![sequence],
                     source_owner: None,
                     continuation: None,
                     gruen: GruenSplitEqPolynomial::new(
@@ -507,7 +531,11 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
             packed_owner_bytes = 0,
         )
         .entered();
-        let rows = match AlignedPackedRegisterRows::collect(&access, physical_rows, log_t >= 28) {
+        let rows = match if log_t < 25 {
+            AlignedPackedRegisterRows::collect_native(&access, physical_rows)
+        } else {
+            AlignedPackedRegisterRows::collect(&access, physical_rows, log_t >= 28)
+        } {
             Ok(rows) => rows,
             Err(AlignedPackedRegisterRowsError::Capacity(capacity)) => {
                 return prepare_capacity_fallback(session, witness, inputs, capacity);
@@ -520,7 +548,12 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
             }
         };
         let source_owner = Arc::new(rows);
-        let source_kind = "direct_witness";
+        let partitioned = source_owner.device_view().active_registers() > 64;
+        let source_kind = if partitioned {
+            "direct_witness_two_banks"
+        } else {
+            "direct_witness"
+        };
         if needs_rd_carry {
             #[cfg(feature = "parallel")]
             let mut rd_indices = source_owner
@@ -540,15 +573,32 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
             session.park(SharedRdIndices(rd_indices));
         }
         let source_bytes = source_owner.allocation_bytes();
-        let continuation_source = (log_t < 25).then(|| Arc::clone(&source_owner));
-        let sequence = self
-            .context
-            .prepare_registers_read_write_cycle_sequence(
-                source_owner,
-                log_t,
-                inputs.challenges.gamma,
-            )
-            .map_err(metal_prepare_error)?;
+        let use_metal_operand_claims = log_t >= METAL_OPERAND_CLAIMS_LOG_T_MIN;
+        let continuation_source = (!use_metal_operand_claims).then(|| Arc::clone(&source_owner));
+        let sequence = if partitioned {
+            [0, 64]
+                .into_iter()
+                .map(|base| {
+                    self.context
+                        .prepare_registers_read_write_cycle_sequence_partition(
+                            Arc::clone(&source_owner),
+                            log_t,
+                            inputs.challenges.gamma,
+                            base,
+                        )
+                        .map_err(metal_prepare_error)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![self
+                .context
+                .prepare_registers_read_write_cycle_sequence(
+                    source_owner,
+                    log_t,
+                    inputs.challenges.gamma,
+                )
+                .map_err(metal_prepare_error)?]
+        };
         record_route(
             cycles,
             "metal_cycle_sequence_v1",
@@ -576,7 +626,7 @@ impl PrepareKernel<AkitaField, RegistersReadWriteChecking<AkitaField>> for Metal
             gamma: inputs.challenges.gamma,
             log_t,
             log_k,
-            use_metal_operand_claims: log_t >= 25,
+            use_metal_operand_claims,
             next_round: 0,
             finished: false,
         });
@@ -668,7 +718,9 @@ mod tests {
     use jolt_verifier::stages::stage4::registers_read_write_checking::{
         RegistersReadWriteChallenges, RegistersReadWriteInputClaims,
     };
-    use jolt_witness::JoltWitnessOracle;
+    use jolt_witness::{JoltWitnessOracle, RowSource};
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::{RngCore, SeedableRng};
 
     use super::*;
     use crate::metal::MetalConfig;
@@ -678,9 +730,112 @@ mod tests {
     use crate::reference::ReferenceBackend;
 
     fn point(len: usize, seed: u64) -> Vec<AkitaField> {
-        (0..len as u64)
-            .map(|index| AkitaField::from_u64(seed + 37 * index + 5))
+        let mut random = ChaCha8Rng::seed_from_u64(seed);
+        (0..len)
+            .map(|_| {
+                AkitaField::from_u128(
+                    u128::from(random.next_u64()) | (u128::from(random.next_u64()) << 64),
+                )
+            })
             .collect()
+    }
+
+    #[test]
+    fn native_trace_shapes_route_to_metal() {
+        let config = MetalConfig::production();
+        for log_t in [22, 24] {
+            assert!(
+                (1usize << log_t) >= config.registers_read_write.trace_cutoff_elements,
+                "T{log_t} must dispatch the register read/write cycle sequence",
+            );
+        }
+    }
+
+    #[test]
+    fn random_register_traces_match_cpu_through_all_rounds() {
+        for seed in [3, 31, 101, 509] {
+            check_fixture_seed(random_fixture(seed), true, false, seed);
+        }
+    }
+
+    #[test]
+    fn gpu_operand_claims_match_cpu_for_random_padded_traces() {
+        for seed in [7, 37, 127] {
+            check_fixture_with_operand_claims(random_fixture(seed), true, false, seed, true);
+        }
+    }
+
+    #[test]
+    fn native_76_registers_select_metal_and_match_random_cpu() {
+        for (log_t, seed) in [(8, 17), (9, 43)] {
+            check_fixture_at_geometry(
+                wide_random_fixture(76, seed),
+                true,
+                false,
+                seed,
+                false,
+                log_t,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn native_128_registers_select_metal_and_match_random_cpu() {
+        for (log_t, seed) in [(8, 23), (9, 47)] {
+            check_fixture_at_geometry(
+                wide_random_fixture(128, seed),
+                true,
+                false,
+                seed,
+                false,
+                log_t,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn banked_gpu_claims_cover_zero_gamma_binary_binds_and_empty_bank() {
+        check_fixture_at_geometry(random_fixture(53), true, false, 53, true, 8, true);
+        check_fixture_at_geometry(wide_random_fixture(128, 59), true, false, 59, true, 9, true);
+    }
+
+    fn wide_random_fixture(active: u8, seed: u64) -> TraceFixture {
+        let mut fixture = TraceFixture::new();
+        for register in 0..active {
+            fixture.op(Some(register), None, None);
+        }
+        let mut random = ChaCha8Rng::seed_from_u64(seed);
+        for cycle in 0..123 {
+            if cycle % 11 == 0 {
+                fixture.noop();
+                continue;
+            }
+            let mut operand = || {
+                let value = random.next_u32();
+                (value % 7 != 0).then_some((value % u32::from(active)) as u8)
+            };
+            fixture.op(operand(), operand(), operand());
+        }
+        fixture
+    }
+
+    fn random_fixture(seed: u64) -> TraceFixture {
+        let mut random = ChaCha8Rng::seed_from_u64(seed);
+        let mut fixture = TraceFixture::new();
+        for cycle in 0..173 {
+            if cycle % 11 == 0 {
+                fixture.noop();
+                continue;
+            }
+            let mut operand = || {
+                let value = random.next_u32();
+                (value % 5 != 0).then_some((value % 32 + 96) as u8)
+            };
+            fixture.op(operand(), operand(), operand());
+        }
+        fixture
     }
 
     #[test]
@@ -691,13 +846,13 @@ mod tests {
     #[test]
     fn adapter_handles_register_capacity_boundary() {
         for active in [64u8, 65, 72, 128] {
-            check_fixture(capacity_fixture(active), active == 64, false);
+            check_fixture(capacity_fixture(active), true, false);
         }
     }
 
     #[test]
-    fn adapter_consumes_stage1_capacity_fallback() {
-        check_fixture(capacity_fixture(72), false, true);
+    fn adapter_consumes_stage1_capacity_marker_for_native_banks() {
+        check_fixture(capacity_fixture(72), true, true);
     }
 
     fn capacity_fixture(active: u8) -> TraceFixture {
@@ -714,7 +869,45 @@ mod tests {
     }
 
     fn check_fixture(fixture: TraceFixture, uses_metal: bool, prepare_stage1: bool) {
-        let log_t = 8;
+        check_fixture_seed(fixture, uses_metal, prepare_stage1, 19);
+    }
+
+    fn check_fixture_seed(
+        fixture: TraceFixture,
+        uses_metal: bool,
+        prepare_stage1: bool,
+        seed: u64,
+    ) {
+        check_fixture_with_operand_claims(fixture, uses_metal, prepare_stage1, seed, false);
+    }
+
+    fn check_fixture_with_operand_claims(
+        fixture: TraceFixture,
+        uses_metal: bool,
+        prepare_stage1: bool,
+        seed: u64,
+        gpu_operand_claims: bool,
+    ) {
+        check_fixture_at_geometry(
+            fixture,
+            uses_metal,
+            prepare_stage1,
+            seed,
+            gpu_operand_claims,
+            8,
+            false,
+        );
+    }
+
+    fn check_fixture_at_geometry(
+        fixture: TraceFixture,
+        uses_metal: bool,
+        prepare_stage1: bool,
+        seed: u64,
+        gpu_operand_claims: bool,
+        log_t: usize,
+        edge_challenges: bool,
+    ) {
         fixture.with_plane(log_t, |witness| {
             let relation = RegistersReadWriteChecking::new(ReadWriteDimensions::new(
                 log_t,
@@ -722,7 +915,7 @@ mod tests {
                 log_t,
                 0,
             ));
-            let r_cycle = point(log_t, 19);
+            let r_cycle = point(log_t, seed);
             let evaluate = |polynomial: JoltVirtualPolynomial| {
                 let table = JoltWitnessOracle::<AkitaField>::oracle_table(
                     witness,
@@ -742,7 +935,11 @@ mod tests {
                 rs2_value: r_cycle,
             };
             let challenges = RegistersReadWriteChallenges {
-                gamma: AkitaField::from_u64(31),
+                gamma: if edge_challenges {
+                    AkitaField::zero()
+                } else {
+                    point(1, seed ^ 31)[0]
+                },
             };
             let inputs = || ProverInputs {
                 relation: &relation,
@@ -753,7 +950,13 @@ mod tests {
             let input_claim = claims.rd_write_value
                 + challenges.gamma * claims.rs1_value
                 + challenges.gamma * challenges.gamma * claims.rs2_value;
-            let round_challenges = point(log_t + REGISTER_ADDRESS_BITS, 101);
+            let round_challenges = if edge_challenges {
+                (0..log_t + REGISTER_ADDRESS_BITS)
+                    .map(|index| AkitaField::from_u64((index % 2) as u64))
+                    .collect()
+            } else {
+                point(log_t + REGISTER_ADDRESS_BITS, seed ^ 101)
+            };
             let mut expected = ReferenceBackend
                 .prepare(&mut ProofSession::default(), witness, inputs())
                 .unwrap();
@@ -795,19 +998,70 @@ mod tests {
                     .state::<PendingRegistersReadWriteStage1Pipelines>()
                     .is_none());
             }
-            let mut actual = metal.prepare(&mut session, witness, inputs()).unwrap();
+            let mut actual: RegistersReadWriteKernelBox = if gpu_operand_claims {
+                let access = witness.random_access().unwrap();
+                let rows = Arc::new(
+                    AlignedPackedRegisterRows::collect_native(&access, access.physical_rows())
+                        .unwrap(),
+                );
+                let sequence = [0, 64]
+                    .into_iter()
+                    .map(|base| {
+                        metal
+                            .context
+                            .prepare_registers_read_write_cycle_sequence_partition(
+                                Arc::clone(&rows),
+                                log_t,
+                                challenges.gamma,
+                                base,
+                            )
+                            .unwrap()
+                    })
+                    .collect();
+                Box::new(MetalRegistersReadWriteKernel {
+                    sequence,
+                    source_owner: None,
+                    continuation: None,
+                    gruen: GruenSplitEqPolynomial::new(
+                        &points.rd_write_value,
+                        BindingOrder::LowToHigh,
+                    ),
+                    r_cycle: points.rd_write_value.clone(),
+                    cycle_challenges: Vec::with_capacity(log_t),
+                    bound_challenges: Vec::with_capacity(log_t + REGISTER_ADDRESS_BITS),
+                    gamma: challenges.gamma,
+                    log_t,
+                    log_k: REGISTER_ADDRESS_BITS,
+                    use_metal_operand_claims: true,
+                    next_round: 0,
+                    finished: false,
+                })
+            } else {
+                metal.prepare(&mut session, witness, inputs()).unwrap()
+            };
             assert!(session.state::<RegisterCapacityExceeded>().is_none());
             assert_eq!(
                 metal.registers_read_write_metal_sequences(),
-                usize::from(uses_metal)
+                usize::from(uses_metal && !gpu_operand_claims)
             );
-            assert!(session.state::<SharedRdIndices>().is_some());
+            if !gpu_operand_claims {
+                assert!(session.state::<SharedRdIndices>().is_some());
+            }
+            assert_eq!(
+                actual.execution_domain(),
+                if uses_metal {
+                    RoundExecutionDomain::Accelerator
+                } else {
+                    RoundExecutionDomain::Host
+                },
+            );
             run_lockstep(
                 expected.as_mut(),
                 actual.as_mut(),
                 input_claim,
                 &round_challenges,
             );
+            assert_eq!(actual.execution_domain(), RoundExecutionDomain::Host);
             assert_eq!(
                 expected.output_claims(&claims).unwrap(),
                 actual.output_claims(&claims).unwrap()

@@ -8,6 +8,7 @@
 
 constant bool registers_read_write_remap_enabled [[function_constant(2)]];
 constant bool registers_read_write_stage1_source [[function_constant(3)]];
+constant uint registers_read_write_source_partition [[function_constant(4)]];
 
 #define REGISTERS_READ_WRITE_RS1_INDEX_SHIFT 32u
 #define REGISTERS_READ_WRITE_RS2_INDEX_SHIFT 40u
@@ -85,6 +86,28 @@ inline PackedRegisterCycleRow registers_read_write_remap_row(
     return row;
 }
 
+inline uchar registers_read_write_partition_index(uchar index, uint base)
+{
+    return uint(index) >= base && uint(index) < base + 64u
+        ? uchar(uint(index) - base)
+        : uchar(REGISTERS_READ_WRITE_NO_REGISTER);
+}
+
+inline PackedRegisterCycleRow registers_read_write_partition_row(PackedRegisterCycleRow row)
+{
+    if (registers_read_write_source_partition != 0u) {
+        uint base = (registers_read_write_source_partition - 1u) * 64u;
+        // The increment belongs to the complete cycle domain, including writes
+        // outside this bank. Preserve original presence before masking indices.
+        row.padding[3] = row.rd_index;
+        row.rs1_index = registers_read_write_partition_index(row.rs1_index, base);
+        row.rs2_index = registers_read_write_partition_index(row.rs2_index, base);
+        row.rd_index = registers_read_write_partition_index(row.rd_index, base);
+        return row;
+    }
+    return registers_read_write_remap_row(row);
+}
+
 inline uchar registers_read_write_decode_index(ulong flags, uint shift)
 {
     uchar plus_one = uchar((flags >> shift) & 0xfful);
@@ -115,7 +138,7 @@ inline PackedRegisterCycleRow registers_read_write_load_source_row(
     uint source_stride)
 {
     if (!registers_read_write_stage1_source) {
-        return registers_read_write_remap_row(packed_rows[row_index]);
+        return registers_read_write_partition_row(packed_rows[row_index]);
     }
     device const InstructionInputRow& instruction_row = instruction_input[row_index];
     ulong flags = instruction_input_row_word(instruction_row, 5u);
@@ -216,7 +239,10 @@ inline ulong registers_read_write_row_mask(PackedRegisterCycleRow row)
 inline SolinasFp128 registers_read_write_increment(
     PackedRegisterCycleRow row)
 {
-    if (row.rd_index == REGISTERS_READ_WRITE_NO_REGISTER) {
+    uchar original_rd = registers_read_write_source_partition != 0u
+        ? row.padding[3]
+        : row.rd_index;
+    if (original_rd == REGISTERS_READ_WRITE_NO_REGISTER) {
         return solinas_zero();
     }
     if (row.rd_post_value >= row.rd_pre_value) {

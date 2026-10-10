@@ -191,7 +191,10 @@ struct DirectPlaneBuffers {
 }
 
 enum CycleSequenceSource {
-    Packed(Arc<AlignedPackedRegisterRows>),
+    Packed {
+        owner: Arc<AlignedPackedRegisterRows>,
+        partition: u32,
+    },
     Stage1 {
         source: RegistersReadWriteStage1Source,
         rd_post: RegistersClaimResidentRdPlane,
@@ -614,9 +617,29 @@ impl SolinasMetal {
         remap_registers: bool,
         stage1_source: bool,
     ) -> Result<ComputePipelineState, MetalError> {
+        self.compile_registers_read_write_partition_pipeline(
+            name,
+            remap_registers,
+            stage1_source,
+            0,
+        )
+    }
+
+    fn compile_registers_read_write_partition_pipeline(
+        &self,
+        name: &'static str,
+        remap_registers: bool,
+        stage1_source: bool,
+        partition: u32,
+    ) -> Result<ComputePipelineState, MetalError> {
         let key = (
             name,
-            Some(0x100 | u32::from(remap_registers) | (u32::from(stage1_source) << 1)),
+            Some(
+                0x100
+                    | u32::from(remap_registers)
+                    | (u32::from(stage1_source) << 1)
+                    | (partition << 2),
+            ),
         );
         {
             let cache = self
@@ -637,6 +660,11 @@ impl SolinasMetal {
             std::ptr::from_ref(&stage1_source).cast::<c_void>(),
             MTLDataType::Bool,
             3,
+        );
+        constants.set_constant_value_at_index(
+            std::ptr::from_ref(&partition).cast::<c_void>(),
+            MTLDataType::UInt,
+            4,
         );
         let function = self
             .library
@@ -894,7 +922,32 @@ impl SolinasMetal {
         gamma: AkitaField,
     ) -> Result<RegistersReadWriteCycleSequence, MetalError> {
         self.prepare_registers_read_write_cycle_sequence_from_source(
-            CycleSequenceSource::Packed(source_owner),
+            CycleSequenceSource::Packed {
+                owner: source_owner,
+                partition: 0,
+            },
+            log_t,
+            gamma,
+        )
+    }
+
+    pub(crate) fn prepare_registers_read_write_cycle_sequence_partition(
+        &self,
+        source_owner: Arc<AlignedPackedRegisterRows>,
+        log_t: usize,
+        gamma: AkitaField,
+        base: u8,
+    ) -> Result<RegistersReadWriteCycleSequence, MetalError> {
+        if log_t >= CROSS_REPRESENTATION_REUSE_LOG_T_MIN || ![0, 64].contains(&base) {
+            return Err(MetalError::InvalidRegistersReadWriteState(
+                "registers read-write partitions require a native 64-column bank",
+            ));
+        }
+        self.prepare_registers_read_write_cycle_sequence_from_source(
+            CycleSequenceSource::Packed {
+                owner: source_owner,
+                partition: u32::from(base / 64) + 1,
+            },
             log_t,
             gamma,
         )
@@ -938,8 +991,9 @@ impl SolinasMetal {
             source_bytes,
             compact_rs1_indices_bytes,
             stage1_source,
+            partition,
         ) = match &source_owner {
-            CycleSequenceSource::Packed(owner) => {
+            CycleSequenceSource::Packed { owner, partition } => {
                 let rows = owner.device_view();
                 let compact_rs1_source = rows.compact_rs1_source();
                 let source_bytes = rows.allocation_bytes();
@@ -970,15 +1024,27 @@ impl SolinasMetal {
                 for (index, mapped) in register_map.iter_mut().enumerate() {
                     *mapped = index as u8;
                 }
+                let mut register_unmap = rows.register_unmap();
+                if *partition != 0 {
+                    let base = ((*partition - 1) * 64) as u8;
+                    for (index, original) in register_unmap.iter_mut().enumerate() {
+                        *original = base + index as u8;
+                    }
+                }
                 (
                     rows.rows(),
-                    rows.active_registers(),
-                    rows.remaps_registers(),
+                    if *partition == 0 {
+                        rows.active_registers()
+                    } else {
+                        64
+                    },
+                    *partition != 0 || rows.remaps_registers(),
                     register_map,
-                    rows.register_unmap(),
+                    register_unmap,
                     source_bytes,
                     compact_rs1_source.map_or(0, |(_, bytes)| bytes),
                     false,
+                    *partition,
                 )
             }
             CycleSequenceSource::Stage1 { source, rd_post } => {
@@ -1027,6 +1093,7 @@ impl SolinasMetal {
                     source_bytes,
                     cycles,
                     true,
+                    0,
                 )
             }
         };
@@ -1101,45 +1168,53 @@ impl SolinasMetal {
             )
         };
         let pipelines = SequencePipelines {
-            first_message: self.compile_registers_read_write_source_pipeline(
+            first_message: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_FIRST_MESSAGE_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            first_message_intersection: self.compile_registers_read_write_source_pipeline(
+            first_message_intersection: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_FIRST_MESSAGE_INTERSECTION_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            bootstrap: self.compile_registers_read_write_source_pipeline(
+            bootstrap: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_BOOTSTRAP_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            stateless_bootstrap: self.compile_registers_read_write_source_pipeline(
+            stateless_bootstrap: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_STATELESS_BOOTSTRAP_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            stateless_replay_bootstrap: self.compile_registers_read_write_source_pipeline(
+            stateless_replay_bootstrap: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_STATELESS_REPLAY_BOOTSTRAP_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            replay_bootstrap: self.compile_registers_read_write_source_pipeline(
+            replay_bootstrap: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_REPLAY_BOOTSTRAP_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            replay_three_bootstrap: self.compile_registers_read_write_source_pipeline(
+            replay_three_bootstrap: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_REPLAY_THREE_BOOTSTRAP_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
-            replay_three_materialize: self.compile_registers_read_write_source_pipeline(
+            replay_three_materialize: self.compile_registers_read_write_partition_pipeline(
                 REGISTERS_READ_WRITE_REPLAY_THREE_MATERIALIZE_PIPELINE,
                 remap_registers,
                 stage1_source,
+                partition,
             )?,
             indexed_state_geometry: self
                 .compile_named_pipeline(REGISTERS_READ_WRITE_INDEXED_STATE_GEOMETRY_PIPELINE)?,
@@ -1230,24 +1305,14 @@ impl SolinasMetal {
 
         let first_groups = (cycles / 2).div_ceil(threads);
         let maximum_cycle_eq_fields = 1usize << log_t.div_ceil(2);
-        let compact_claim_source = log_t >= COMPACT_RS1_SOURCE_LOG_T_MIN || stage1_source;
-        let (maximum_e_in_fields, maximum_e_out_fields, maximum_partial_fields) =
-            if compact_claim_source {
-                let joint_bits = log_t + REGISTER_ADDRESS_BITS;
-                let high_bits = core::cmp::min(log_t, joint_bits.div_ceil(2));
-                let low_cycle_bits = joint_bits - high_bits - REGISTER_ADDRESS_BITS;
-                (
-                    core::cmp::max(maximum_cycle_eq_fields, 1usize << high_bits),
-                    core::cmp::max(maximum_cycle_eq_fields, 1usize << (joint_bits - high_bits)),
-                    first_groups.max(physical_rows.div_ceil(1usize << low_cycle_bits)),
-                )
-            } else {
-                (
-                    maximum_cycle_eq_fields,
-                    maximum_cycle_eq_fields,
-                    first_groups,
-                )
-            };
+        let joint_bits = log_t + REGISTER_ADDRESS_BITS;
+        let high_bits = core::cmp::min(log_t, joint_bits.div_ceil(2));
+        let low_cycle_bits = joint_bits - high_bits - REGISTER_ADDRESS_BITS;
+        let maximum_e_in_fields = core::cmp::max(maximum_cycle_eq_fields, 1usize << high_bits);
+        let maximum_e_out_fields =
+            core::cmp::max(maximum_cycle_eq_fields, 1usize << (joint_bits - high_bits));
+        let maximum_partial_fields =
+            first_groups.max(physical_rows.div_ceil(1usize << low_cycle_bits));
         let scratch = SequenceScratch::new(
             self,
             maximum_partial_fields,
@@ -1281,7 +1346,7 @@ impl SolinasMetal {
             compact_rs1_source,
             compact_rs1_owner,
         ) = match source_owner {
-            CycleSequenceSource::Packed(owner) => {
+            CycleSequenceSource::Packed { owner, .. } => {
                 let rows = owner.device_view();
                 let compact_owner = owner.compact_rs1_owner();
                 let source = self.device.new_buffer_with_bytes_no_copy(
@@ -4432,6 +4497,90 @@ fn buffer_slice_mut<T>(buffer: &Buffer, length: usize) -> &mut [T] {
 mod tests {
     use super::*;
     use crate::metal::solinas::buffer_from_slice;
+    use crate::optimized::registers_read_write::test_support::TraceFixture;
+    use crate::optimized::registers_read_write::RegisterCycleRow;
+    use jolt_field::Ring as _;
+    use jolt_poly::{BindingOrder, GruenSplitEqPolynomial, Polynomial};
+    use jolt_witness::RowSource as _;
+
+    #[test]
+    fn banks_preserve_global_increments_across_63_64_and_extreme_values() {
+        let context = SolinasMetal::for_akita().unwrap();
+        for (pre, post) in [(0, 1), (u64::MAX, 0), (0, u64::MAX)] {
+            let mut fixture = TraceFixture::new();
+            fixture.op(Some(63), None, None);
+            fixture.op(Some(64), None, None);
+            fixture.with_plane(4, |witness| {
+                let access = witness.random_access().unwrap();
+                let owner =
+                    Arc::new(AlignedPackedRegisterRows::collect_native(&access, 2).unwrap());
+                let rows = [
+                    PackedRegisterCycleRow::pack(RegisterCycleRow {
+                        rs1: None,
+                        rs2: None,
+                        rd: Some((63, pre, post)),
+                    }),
+                    PackedRegisterCycleRow::pack(RegisterCycleRow {
+                        rs1: None,
+                        rs2: None,
+                        rd: Some((64, 0, 2)),
+                    }),
+                ];
+                let source = buffer_from_slice(&context.device, &rows);
+                let mut banks = [0, 64].map(|base| {
+                    let mut sequence = context
+                        .prepare_registers_read_write_cycle_sequence_partition(
+                            Arc::clone(&owner),
+                            4,
+                            AkitaField::zero(),
+                            base,
+                        )
+                        .unwrap();
+                    // Owned copied rows let this test specify u64 endpoints exactly.
+                    sequence.source = Some(source.clone());
+                    sequence
+                });
+                let mut gruen =
+                    GruenSplitEqPolynomial::new(&[AkitaField::zero(); 4], BindingOrder::LowToHigh);
+                let mut quadratic = [AkitaField::zero(); 2];
+                for bank in &mut banks {
+                    let message = bank
+                        .message(
+                            gruen.e_in_current(),
+                            gruen.e_out_current(),
+                            AkitaField::zero(),
+                        )
+                        .unwrap();
+                    quadratic[0] += message.quadratic[0];
+                    quadratic[1] += message.quadratic[1];
+                }
+                if pre == 0 && post == 1 {
+                    assert_eq!(quadratic, [AkitaField::one(), -AkitaField::one()]);
+                }
+                let challenges = [AkitaField::zero(); 4];
+                for challenge in &challenges[..3] {
+                    gruen.bind(*challenge);
+                    for bank in &mut banks {
+                        let _ = bank
+                            .bind_and_message(
+                                *challenge,
+                                gruen.e_in_current(),
+                                gruen.e_out_current(),
+                            )
+                            .unwrap();
+                    }
+                }
+                let mut inc = vec![AkitaField::zero(); 16];
+                inc[0] = AkitaField::from_u64(post) - AkitaField::from_u64(pre);
+                inc[1] = AkitaField::from_u64(2);
+                let point = challenges.iter().rev().copied().collect::<Vec<_>>();
+                let expected = Polynomial::new(inc).evaluate(&point);
+                for bank in &mut banks {
+                    assert_eq!(bank.finish(challenges[3]).unwrap().increment, expected);
+                }
+            });
+        }
+    }
 
     #[test]
     fn stage1_retains_operand_carry_at_compact_source_threshold() {

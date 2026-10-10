@@ -188,6 +188,27 @@ impl AlignedPackedRegisterRows {
         rows: usize,
         include_compact_rs1: bool,
     ) -> Result<Self, AlignedPackedRegisterRowsError> {
+        Self::collect_with_capacity(
+            access,
+            rows,
+            include_compact_rs1,
+            MAX_REGISTER_BLOCK_CAPACITY,
+        )
+    }
+
+    pub(crate) fn collect_native(
+        access: &RandomAccessRows,
+        rows: usize,
+    ) -> Result<Self, AlignedPackedRegisterRowsError> {
+        Self::collect_with_capacity(access, rows, false, 128)
+    }
+
+    fn collect_with_capacity(
+        access: &RandomAccessRows,
+        rows: usize,
+        include_compact_rs1: bool,
+        register_capacity: usize,
+    ) -> Result<Self, AlignedPackedRegisterRowsError> {
         if rows > access.cycles() {
             return Err(AlignedPackedRegisterRowsError::Storage(
                 "aligned packed register collection exceeds the cycle domain",
@@ -233,7 +254,7 @@ impl AlignedPackedRegisterRows {
                 .add(logical_bytes)
                 .write_bytes(0, owner.row_allocation_bytes - logical_bytes);
         }
-        owner.finish_layout()?;
+        owner.finish_layout(register_capacity)?;
         Ok(owner)
     }
 
@@ -323,7 +344,10 @@ impl AlignedPackedRegisterRows {
         })
     }
 
-    fn finish_layout(&mut self) -> Result<(), AlignedPackedRegisterRowsError> {
+    fn finish_layout(
+        &mut self,
+        register_capacity: usize,
+    ) -> Result<(), AlignedPackedRegisterRowsError> {
         // SAFETY: both constructors initialize every row before calling this
         // method, and retain exclusive access to the allocation.
         let rows = unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.rows) };
@@ -369,10 +393,11 @@ impl AlignedPackedRegisterRows {
             ));
         }
         let active_registers = active_register_mask.count_ones() as usize;
-        if active_registers > MAX_REGISTER_BLOCK_CAPACITY {
+        if active_registers > register_capacity {
             return Err(RegisterCapacityExceeded { active_registers }.into());
         }
-        let remap_registers = active_register_mask >> 64 != 0;
+        let remap_registers =
+            active_registers <= MAX_REGISTER_BLOCK_CAPACITY && active_register_mask >> 64 != 0;
         let mut register_map = [0u8; 128];
         let mut register_unmap = [0u8; 64];
         if remap_registers {
