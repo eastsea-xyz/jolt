@@ -254,6 +254,8 @@ type AkitaBackend = JoltAkitaBackend<F, PCS>;
 /// `Hybrid` keeps the booleanity / bytecode / instruction read-raf slots on
 /// the CPU and the rest on Metal.
 /// `JOLT_AKITA_METAL=full|hybrid|commit|cpu` overrides the automatic choice.
+/// Metal is automatic on Apple Silicon; other hosts default to CPU. A Metal
+/// error discards the backend and retries the whole proof once on CPU.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BackendMode {
     Cpu,
@@ -266,16 +268,76 @@ enum BackendMode {
 const METAL_MAX_BYTECODE_LEN: usize = u32::MAX as usize - 1;
 
 fn backend_mode(bytecode_len: usize) -> BackendMode {
-    if !cfg!(all(feature = "metal", target_os = "macos")) {
+    backend_mode_for_setting(
+        bytecode_len,
+        std::env::var("JOLT_AKITA_METAL").ok().as_deref(),
+        cfg!(all(feature = "metal", target_os = "macos")),
+        cfg!(target_arch = "aarch64"),
+    )
+}
+
+fn backend_mode_for_setting(
+    bytecode_len: usize,
+    setting: Option<&str>,
+    metal_supported: bool,
+    apple_silicon: bool,
+) -> BackendMode {
+    if !metal_supported {
         return BackendMode::Cpu;
     }
-    match std::env::var("JOLT_AKITA_METAL").as_deref() {
-        Ok("full") => BackendMode::MetalFull,
-        Ok("hybrid") => BackendMode::MetalHybrid,
-        Ok("commit") => BackendMode::MetalCommitOnly,
-        Ok("cpu") => BackendMode::Cpu,
+    match setting {
+        Some("full") => BackendMode::MetalFull,
+        Some("hybrid") => BackendMode::MetalHybrid,
+        Some("commit") => BackendMode::MetalCommitOnly,
+        Some("cpu") => BackendMode::Cpu,
+        _ if !apple_silicon => BackendMode::Cpu,
         _ if bytecode_len > METAL_MAX_BYTECODE_LEN => BackendMode::MetalCommitOnly,
         _ => BackendMode::MetalFull,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ForcedMetalFailure {
+    Initialize,
+    Prove,
+}
+
+impl ForcedMetalFailure {
+    fn setting(self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::Prove => "prove",
+        }
+    }
+
+    fn error(self) -> Box<dyn StdError + Send + Sync> {
+        telemetry::metadata("backend_forced_error", self.setting());
+        IoError::other(format!(
+            "forced Metal {} failure (JOLT_AKITA_METAL_FORCE_ERROR)",
+            self.setting()
+        ))
+        .into()
+    }
+}
+
+/// Qualification-only diagnostic: `prove` discards a completed Metal proof,
+/// then exercises the same fresh CPU retry used for real runtime failures.
+fn forced_metal_failure(
+    mode: BackendMode,
+    setting: Option<&std::ffi::OsStr>,
+) -> Result<Option<ForcedMetalFailure>, Box<dyn StdError + Send + Sync>> {
+    if mode == BackendMode::Cpu {
+        return Ok(None);
+    }
+    match setting {
+        None => Ok(None),
+        Some(value) if value == "initialize" => Ok(Some(ForcedMetalFailure::Initialize)),
+        Some(value) if value == "prove" => Ok(Some(ForcedMetalFailure::Prove)),
+        Some(_) => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "JOLT_AKITA_METAL_FORCE_ERROR expects initialize|prove",
+        )
+        .into()),
     }
 }
 
@@ -305,35 +367,94 @@ fn build_backend(mode: BackendMode) -> Result<AkitaBackend, Box<dyn StdError + S
     }
 }
 
+type BackendCache = RefCell<Option<(BackendMode, Rc<AkitaBackend>)>>;
+
 thread_local! {
     // The backend's kernel slots are not `Sync`, so it is cached per thread.
     // Metal initialization compiles pipelines and allocates device state, so
     // it is not repeated per proof.
-    static BACKEND: RefCell<Option<(BackendMode, Rc<AkitaBackend>)>> = const { RefCell::new(None) };
+    static BACKEND: BackendCache = const { RefCell::new(None) };
+}
+
+fn cached_backend(
+    cache: &BackendCache,
+    mode: BackendMode,
+    bytecode_len: usize,
+    build: &mut impl FnMut(BackendMode) -> Result<AkitaBackend, Box<dyn StdError + Send + Sync>>,
+) -> Result<Rc<AkitaBackend>, Box<dyn StdError + Send + Sync>> {
+    let mut cached = cache.borrow_mut();
+    if let Some((cached_mode, backend)) = cached.as_ref() {
+        if *cached_mode == mode {
+            return Ok(Rc::clone(backend));
+        }
+    }
+    // Release the previous device before allocating another backend.
+    *cached = None;
+    let _profile = telemetry::stage("backend.initialize");
+    eprintln!("jolt-sdk: Akita prover backend {mode:?} (bytecode length {bytecode_len})");
+    let backend = Rc::new(build(mode)?);
+    *cached = Some((mode, Rc::clone(&backend)));
+    Ok(backend)
+}
+
+fn with_backend_for_mode<R>(
+    cache: &BackendCache,
+    mode: BackendMode,
+    bytecode_len: usize,
+    forced_failure: Option<ForcedMetalFailure>,
+    mut build: impl FnMut(BackendMode) -> Result<AkitaBackend, Box<dyn StdError + Send + Sync>>,
+    mut f: impl FnMut(&AkitaBackend) -> Result<R, Box<dyn StdError + Send + Sync>>,
+) -> Result<R, Box<dyn StdError + Send + Sync>> {
+    telemetry::metadata("backend_requested_mode", format!("{mode:?}"));
+    telemetry::metadata("backend_mode", format!("{mode:?}"));
+    let attempt = (|| {
+        if mode != BackendMode::Cpu && forced_failure == Some(ForcedMetalFailure::Initialize) {
+            return Err(ForcedMetalFailure::Initialize.error());
+        }
+        let backend = cached_backend(cache, mode, bytecode_len, &mut build)?;
+        let result = f(&backend);
+        if mode != BackendMode::Cpu
+            && forced_failure == Some(ForcedMetalFailure::Prove)
+            && result.is_ok()
+        {
+            // Drop all output from the Metal attempt before starting CPU work.
+            drop(result);
+            return Err(ForcedMetalFailure::Prove.error());
+        }
+        result
+    })();
+    match attempt {
+        Ok(proof) => Ok(proof),
+        Err(error) if mode == BackendMode::Cpu => Err(error),
+        Err(error) => {
+            // The attempt has returned, dropping its proof session/transcript
+            // and local backend handle. Evict the remaining cached GPU owner.
+            *cache.borrow_mut() = None;
+            telemetry::metadata("backend_fallback_from", format!("{mode:?}"));
+            telemetry::metadata("backend_fallback_error", error.to_string());
+            telemetry::metadata("backend_mode", "Cpu");
+            eprintln!("jolt-sdk: Akita {mode:?} failed: {error}; retrying the proof on CPU");
+            let _profile = telemetry::stage("backend.cpu_retry");
+            let cpu = cached_backend(cache, BackendMode::Cpu, bytecode_len, &mut build)?;
+            // The closure only borrows the witness/setup. Calling prove again
+            // creates a new transcript and session without cloning those inputs.
+            f(&cpu)
+        }
+    }
 }
 
 fn with_backend<R>(
     bytecode_len: usize,
-    f: impl FnOnce(&AkitaBackend) -> Result<R, Box<dyn StdError + Send + Sync>>,
+    f: impl FnMut(&AkitaBackend) -> Result<R, Box<dyn StdError + Send + Sync>>,
 ) -> Result<R, Box<dyn StdError + Send + Sync>> {
     let mode = backend_mode(bytecode_len);
-    telemetry::metadata("backend_mode", format!("{mode:?}"));
-    let backend = BACKEND.with(|cell| -> Result<_, Box<dyn StdError + Send + Sync>> {
-        let mut cached = cell.borrow_mut();
-        match cached.as_ref() {
-            Some((cached_mode, backend)) if *cached_mode == mode => Ok(Rc::clone(backend)),
-            _ => {
-                let _profile = telemetry::stage("backend.initialize");
-                eprintln!(
-                    "jolt-sdk: Akita prover backend {mode:?} (bytecode length {bytecode_len})"
-                );
-                let backend = Rc::new(build_backend(mode)?);
-                *cached = Some((mode, Rc::clone(&backend)));
-                Ok(backend)
-            }
-        }
-    })?;
-    f(&backend)
+    let forced_failure = forced_metal_failure(
+        mode,
+        std::env::var_os("JOLT_AKITA_METAL_FORCE_ERROR").as_deref(),
+    )?;
+    BACKEND.with(|cache| {
+        with_backend_for_mode(cache, mode, bytecode_len, forced_failure, build_backend, f)
+    })
 }
 
 #[expect(
@@ -528,3 +649,7 @@ pub fn verify_program(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "host_akita_tests.rs"]
+mod tests;
