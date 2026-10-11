@@ -589,7 +589,9 @@ mod tests {
     ) -> [Vec<AkitaField>; BYTECODE_CYCLE_TABLES] {
         std::array::from_fn(|table| {
             tables[table]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| pair[0] + challenge * (pair[1] - pair[0]))
                 .collect()
         })

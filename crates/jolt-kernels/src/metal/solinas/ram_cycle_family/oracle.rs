@@ -111,9 +111,9 @@ impl<F: Field> DenseRamValCheckOracle<F> {
         let mut at_zero = F::zero();
         let mut at_two = F::zero();
         let mut at_three = F::zero();
-        let increment_pairs = self.ram_increment.chunks_exact(2);
-        let ra_pairs = self.ram_ra.chunks_exact(2);
-        let lt_pairs = self.lt_cycle_plus_gamma.chunks_exact(2);
+        let increment_pairs = self.ram_increment.as_chunks::<2>().0.iter();
+        let ra_pairs = self.ram_ra.as_chunks::<2>().0.iter();
+        let lt_pairs = self.lt_cycle_plus_gamma.as_chunks::<2>().0.iter();
         for ((increment, ra), lt) in increment_pairs.zip(ra_pairs).zip(lt_pairs) {
             let inc_zero = pair_entry(increment, 0)?;
             let inc_one = pair_entry(increment, 1)?;
@@ -186,7 +186,7 @@ fn bind_dense<F: Field>(values: &[F], challenge: F) -> Result<Vec<F>, RamValErro
         return Err(RamValError::InvalidDenseState);
     }
     let mut output = Vec::with_capacity(values.len() / 2);
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         let low = pair_entry(pair, 0)?;
         let high = pair_entry(pair, 1)?;
         output.push(low + challenge * (high - low));

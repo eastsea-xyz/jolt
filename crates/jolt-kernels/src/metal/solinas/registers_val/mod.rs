@@ -1011,7 +1011,7 @@ impl RegistersValFirstTransitionInvocation {
         };
         self.context
             .validate_inputs("registers val dense state", values)?;
-        for (output, row) in output.iter_mut().zip(values.chunks_exact(2)) {
+        for (output, row) in output.iter_mut().zip(values.as_chunks::<2>().0.iter()) {
             *output = [row[0].into_jolt_field(), row[1].into_jolt_field()];
         }
         Ok(())
@@ -1187,7 +1187,7 @@ impl RegistersValSequence {
         };
         self.context
             .validate_inputs("registers val resident dense state", values)?;
-        for (output, row) in output.iter_mut().zip(values.chunks_exact(2)) {
+        for (output, row) in output.iter_mut().zip(values.as_chunks::<2>().0.iter()) {
             *output = [row[0].into_jolt_field(), row[1].into_jolt_field()];
         }
         Ok(())

@@ -975,7 +975,7 @@ fn bytecode_prepare_can_fallback(error: &MetalError) -> bool {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "Metal bytecode parity setup")]
 mod tests {
-    use jolt_field::{One as _, Ring as _};
+    use jolt_field::One as _;
     use std::num::NonZeroUsize;
 
     use jolt_claims::protocols::jolt::geometry::bytecode::BytecodeReadRafDimensions;

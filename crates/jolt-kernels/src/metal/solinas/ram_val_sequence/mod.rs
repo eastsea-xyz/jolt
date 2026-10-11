@@ -894,7 +894,9 @@ fn bind_adjacent(
         ));
     }
     Ok(values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| pair[0] + challenge * (pair[1] - pair[0]))
         .collect())
 }

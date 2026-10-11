@@ -555,7 +555,7 @@ impl<F: Field> RamRafAffineTail<F> {
         let mut delta_sum = F::zero();
         let mut u_zero = self.base;
         let pair_step = self.step + self.step;
-        for pair in self.ra.chunks_exact(2) {
+        for pair in self.ra.as_chunks::<2>().0 {
             let r_zero = pair[0];
             let r_one = pair[1];
             at_zero += u_zero * r_zero;
@@ -719,7 +719,9 @@ mod tests {
         step: AkitaField,
         x: AkitaField,
     ) -> AkitaField {
-        ra.chunks_exact(2)
+        ra.as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .map(|(pair_index, pair)| {
                 let index = AkitaField::from_u64((2 * pair_index) as u64);

@@ -1406,7 +1406,6 @@ const _: () = assert!(size_of::<WeightPrefixParams>() == 16);
 #[expect(clippy::unwrap_used, reason = "GPU geometry fixtures")]
 mod tests {
     use jolt_field::Prime128OffsetA7F7 as AkitaField;
-    use jolt_field::Zero as _;
     use jolt_poly::{BindingOrder, GruenSplitEqPolynomial};
 
     use super::*;

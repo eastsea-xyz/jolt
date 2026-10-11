@@ -693,7 +693,7 @@ impl OuterRemainderSequence {
         self.storage
             .context
             .validate_inputs("outer CPU tail", fields)?;
-        for (index, pair) in fields.chunks_exact(2).enumerate() {
+        for (index, pair) in fields.as_chunks::<2>().0.iter().enumerate() {
             az[index] = pair[0].into_jolt_field();
             bz[index] = pair[1].into_jolt_field();
         }

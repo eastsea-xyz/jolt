@@ -1181,7 +1181,9 @@ impl<F: JoltField> OptimizedInstructionReadRafKernel<F> {
             );
 
             let polynomials = flat
-                .chunks_exact(CHUNK_SIZE)
+                .as_chunks::<CHUNK_SIZE>()
+                .0
+                .iter()
                 .map(|coefficients| Polynomial::new(coefficients.to_vec()))
                 .collect();
             (table, polynomials)
@@ -1821,7 +1823,9 @@ impl OptimizedInstructionReadRafKernel<AkitaField> {
                 .table(table.index())
                 .ok_or_else(|| metal_state_error("resident address suffix table is absent"))?;
             let polynomials = flat
-                .chunks_exact(CHUNK_SIZE)
+                .as_chunks::<CHUNK_SIZE>()
+                .0
+                .iter()
                 .map(|coefficients| Polynomial::new(convert(coefficients)))
                 .collect();
             suffix_tables.push((table, polynomials));

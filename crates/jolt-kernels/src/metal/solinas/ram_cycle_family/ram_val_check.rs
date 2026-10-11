@@ -537,7 +537,7 @@ fn bind_adjacent<F: Field>(values: &[F], challenge: F) -> Result<Vec<F>, RamValE
         return Err(RamValError::InvalidLtState);
     }
     let mut bound = Vec::with_capacity(values.len() / 2);
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         let low = pair.first().copied().ok_or(RamValError::InvalidLtState)?;
         let high = pair.get(1).copied().ok_or(RamValError::InvalidLtState)?;
         bound.push(low + challenge * (high - low));

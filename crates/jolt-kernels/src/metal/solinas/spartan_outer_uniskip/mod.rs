@@ -1750,7 +1750,9 @@ mod tests {
 
     fn bind_table(values: &[AkitaField], challenge: AkitaField) -> Vec<AkitaField> {
         values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair[0] + challenge * (pair[1] - pair[0]))
             .collect()
     }
