@@ -72,8 +72,8 @@ struct Buffers {
     addresses: Buffer,
     branches_a: Buffer,
     branches_b: Buffer,
-    dense_a: Buffer,
-    dense_b: Buffer,
+    dense_a: Option<Buffer>,
+    dense_b: Option<Buffer>,
     e_in: Buffer,
     e_out: Buffer,
     e_in_b: Buffer,
@@ -280,6 +280,10 @@ impl SolinasMetal {
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
         .ok_or(MetalError::InputTooLong(rows))?;
         self.validate_buffer_length(source_bytes)?;
+        // Preserve the shape/length preflight for the deferred slabs, including
+        // the minimum shape whose terminal bind never needs dense_b.
+        self.validate_buffer_length(byte_length::<Fp128>(dense_a_capacity)?)?;
+        self.validate_buffer_length(byte_length::<Fp128>(dense_b_capacity)?)?;
         self.validate_additional_working_set(
             source_bytes
                 .checked_add(owned_bytes)
@@ -299,8 +303,10 @@ impl SolinasMetal {
             addresses,
             branches_a: new_field_buffer(self, branch_capacity)?,
             branches_b: new_field_buffer(self, branch_capacity)?,
-            dense_a: new_field_buffer(self, dense_a_capacity)?,
-            dense_b: new_field_buffer(self, dense_b_capacity)?,
+            // Lazy widths use addresses and branches only. The dense kernels
+            // receive their original exact capacities at their first use.
+            dense_a: None,
+            dense_b: None,
             e_in: new_field_buffer(self, e_in_capacity)?,
             e_out: new_field_buffer(self, e_out_capacity)?,
             e_in_b: new_field_buffer(self, e_in_capacity)?,
@@ -377,7 +383,7 @@ impl RamRaSequence {
             let command_buffer = self.context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipelines.terminal);
-            encoder.set_buffer(0, Some(self.dense_source_buffer()), 0);
+            encoder.set_buffer(0, Some(self.dense_source_buffer()?), 0);
             encoder.set_buffer(1, Some(&self.buffers.partial_a), 0);
             set_inline_bytes(encoder, 2, &Fp128::from_jolt_field(&challenge));
             set_inline_bytes(encoder, 3, &(self.factors as u32));
@@ -442,10 +448,13 @@ impl RamRaSequence {
         }
         let source_elements = self.rows / next_width;
         self.validate_weights(source_elements / 2, e_in, e_out)?;
+        let materialize = next_width == MATERIALIZE_WIDTH;
+        if materialize && self.buffers.dense_a.is_none() {
+            self.buffers.dense_a = Some(self.new_deferred_dense_buffer(source_elements)?);
+        }
         self.write_weights(e_in, e_out)?;
         let weight_in_a = self.e_in_in_a ^ (e_in.len() != self.e_in_elements);
         let weight_out_a = self.e_out_in_a ^ (e_out.len() != self.e_out_elements);
-        let materialize = next_width == MATERIALIZE_WIDTH;
         let message_params = MessageParams {
             e_in_length: u32::try_from(e_in.len())
                 .map_err(|_| MetalError::InputTooLong(e_in.len()))?,
@@ -507,7 +516,7 @@ impl RamRaSequence {
                 encoder.set_compute_pipeline_state(&self.pipelines.materialize);
                 encoder.set_buffer(0, Some(&self.buffers.addresses), 0);
                 encoder.set_buffer(1, Some(self.branch_buffer(message_branches_in_a)), 0);
-                encoder.set_buffer(2, Some(&self.buffers.dense_a), 0);
+                encoder.set_buffer(2, Some(self.dense_source_buffer()?), 0);
                 encoder.set_buffer(3, Some(self.e_in_buffer(weight_in_a)), 0);
                 encoder.set_buffer(4, Some(self.e_out_buffer(weight_out_a)), 0);
                 encoder.set_buffer(5, Some(&self.buffers.partial_a), 0);
@@ -567,6 +576,9 @@ impl RamRaSequence {
             ));
         }
         self.validate_weights(self.dense_elements / 4, e_in, e_out)?;
+        if self.buffers.dense_b.is_none() {
+            self.buffers.dense_b = Some(self.new_deferred_dense_buffer(self.dense_elements / 2)?);
+        }
         self.write_weights(e_in, e_out)?;
         let weight_in_a = self.e_in_in_a ^ (e_in.len() != self.e_in_elements);
         let weight_out_a = self.e_out_in_a ^ (e_out.len() != self.e_out_elements);
@@ -588,8 +600,8 @@ impl RamRaSequence {
             let encoder = command_buffer.new_compute_command_encoder();
             self.encode_weight_contraction(encoder, e_in.len(), e_out.len());
             encoder.set_compute_pipeline_state(&self.pipelines.dense);
-            encoder.set_buffer(0, Some(self.dense_source_buffer()), 0);
-            encoder.set_buffer(1, Some(self.dense_destination_buffer()), 0);
+            encoder.set_buffer(0, Some(self.dense_source_buffer()?), 0);
+            encoder.set_buffer(1, Some(self.dense_destination_buffer()?), 0);
             encoder.set_buffer(2, Some(self.e_in_buffer(weight_in_a)), 0);
             encoder.set_buffer(3, Some(self.e_out_buffer(weight_out_a)), 0);
             encoder.set_buffer(4, Some(&self.buffers.partial_a), 0);
@@ -804,30 +816,52 @@ impl RamRaSequence {
         }
     }
 
-    fn dense_source_buffer(&self) -> &Buffer {
-        if self.dense_in_a {
+    fn dense_source_buffer(&self) -> Result<&Buffer, MetalError> {
+        let buffer = if self.dense_in_a {
             &self.buffers.dense_a
         } else {
             &self.buffers.dense_b
-        }
+        };
+        buffer.as_ref().ok_or(MetalError::InvalidRamRaState(
+            "the resident dense source buffer is missing",
+        ))
     }
 
-    fn dense_destination_buffer(&self) -> &Buffer {
-        if self.dense_in_a {
+    fn dense_destination_buffer(&self) -> Result<&Buffer, MetalError> {
+        let buffer = if self.dense_in_a {
             &self.buffers.dense_b
         } else {
             &self.buffers.dense_a
-        }
+        };
+        buffer.as_ref().ok_or(MetalError::InvalidRamRaState(
+            "the resident dense destination buffer is missing",
+        ))
+    }
+
+    fn new_deferred_dense_buffer(&self, elements: usize) -> Result<Buffer, MetalError> {
+        let capacity = self
+            .factors
+            .checked_mul(elements)
+            .ok_or(MetalError::InputTooLong(elements))?;
+        let bytes = byte_length::<Fp128>(capacity)?;
+        self.context.validate_additional_working_set(bytes)?;
+        let buffer = new_field_buffer(&self.context, capacity)?;
+        tracing::debug!(
+            rows = self.rows,
+            factors = self.factors,
+            elements,
+            bytes,
+            "deferred RAM RA dense slab allocated"
+        );
+        Ok(buffer)
     }
 }
 
 #[cfg(feature = "allocative")]
 fn device_storage_bytes(buffers: &Buffers) -> usize {
-    [
+    let fixed = [
         &buffers.branches_a,
         &buffers.branches_b,
-        &buffers.dense_a,
-        &buffers.dense_b,
         &buffers.e_in,
         &buffers.e_out,
         &buffers.e_in_b,
@@ -838,7 +872,14 @@ fn device_storage_bytes(buffers: &Buffers) -> usize {
     .into_iter()
     .fold(0usize, |bytes, buffer| {
         bytes.saturating_add(buffer.length() as usize)
-    })
+    });
+    buffers
+        .dense_a
+        .iter()
+        .chain(buffers.dense_b.iter())
+        .fold(fixed, |bytes, buffer| {
+            bytes.saturating_add(buffer.length() as usize)
+        })
 }
 
 fn new_field_buffer(context: &SolinasMetal, elements: usize) -> Result<Buffer, MetalError> {

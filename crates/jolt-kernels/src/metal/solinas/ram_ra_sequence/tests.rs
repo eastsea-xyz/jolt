@@ -7,6 +7,7 @@
 use jolt_claims::protocols::jolt::geometry::dimensions::committed_address_chunks;
 use jolt_field::{One as _, Ring as _, Zero as _};
 use jolt_poly::{BindingOrder, EqPolynomial, GruenSplitEqPolynomial, UnivariatePoly};
+use metal::foreign_types::ForeignType;
 
 use super::*;
 use crate::metal::ram_records::NO_ACCESS;
@@ -95,6 +96,35 @@ fn cpu_poly(eq: &[AkitaField], tables: &[Vec<AkitaField>]) -> UnivariatePoly<Aki
     UnivariatePoly::interpolate_over_integers(&evaluations)
 }
 
+fn dense_allocation_snapshot(sequence: &RamRaSequence) -> ([u64; 2], [usize; 2]) {
+    (
+        [
+            sequence
+                .buffers
+                .dense_a
+                .as_ref()
+                .map_or(0, |buffer| buffer.length()),
+            sequence
+                .buffers
+                .dense_b
+                .as_ref()
+                .map_or(0, |buffer| buffer.length()),
+        ],
+        [
+            sequence
+                .buffers
+                .dense_a
+                .as_ref()
+                .map_or(0, |buffer| buffer.as_ptr() as usize),
+            sequence
+                .buffers
+                .dense_b
+                .as_ref()
+                .map_or(0, |buffer| buffer.as_ptr() as usize),
+        ],
+    )
+}
+
 fn assert_rejected_without_mutation(
     sequence: &mut RamRaSequence,
     call: impl FnOnce(&mut RamRaSequence) -> Result<[AkitaField; 8], MetalError>,
@@ -111,6 +141,7 @@ fn assert_rejected_without_mutation(
             sequence.dense,
             sequence.dense_in_a,
             sequence.dense_elements,
+            dense_allocation_snapshot(sequence),
         )
     };
     let before = state(sequence);
@@ -144,7 +175,7 @@ fn assert_rejected_without_mutation(
         }
         if sequence.dense {
             append(
-                sequence.dense_source_buffer(),
+                sequence.dense_source_buffer().unwrap(),
                 sequence.factors * sequence.dense_elements,
             );
         }
@@ -163,6 +194,7 @@ fn run_randomized_case(
     chunk_bits: usize,
     seed: u64,
     activity: usize,
+    check_dense_allocations: bool,
 ) {
     let mut random = Random(seed);
     let rows = 1usize << log_t;
@@ -232,6 +264,7 @@ fn run_randomized_case(
             gruen.e_out_current().len(),
         )
         .expect("native committed RAM RA shape must have a direct resident sequence");
+    let mut dense_allocations = vec![dense_allocation_snapshot(&sequence)];
     let challenges = (0..log_t)
         .map(|round| match round {
             0 => AkitaField::zero(),
@@ -293,6 +326,7 @@ fn run_randomized_case(
         claim = expected_poly.evaluate(challenges[round]);
         assert_eq!(sequence.is_dense(), round >= 4);
         assert_eq!(sequence.current_elements(), rows >> round);
+        dense_allocations.push(dense_allocation_snapshot(&sequence));
     }
     let last = challenges[log_t - 1];
     for table in &mut expected {
@@ -321,13 +355,88 @@ fn run_randomized_case(
     assert_rejected_without_mutation(&mut sequence, |sequence| {
         sequence.message(gruen.e_in_current(), gruen.e_out_current())
     });
+    if check_dense_allocations {
+        // Check timing after every q grid, full polynomial and terminal claim
+        // has matched the independent CPU oracle above. The unmodified source
+        // reaches this assertion, then fails because both slabs were eager.
+        assert_eq!(dense_allocations[0], ([0; 2], [0; 2]));
+        let first_a = dense_allocations[5].1[0];
+        let first_b = if log_t > 5 {
+            dense_allocations[6].1[1]
+        } else {
+            0
+        };
+        assert_ne!(first_a, 0);
+        if first_b != 0 {
+            assert_ne!(first_a, first_b);
+        }
+        let a_bytes = (factors * (rows / MATERIALIZE_WIDTH) * size_of::<Fp128>()) as u64;
+        let b_bytes = a_bytes / 2;
+        for (round, &(lengths, identities)) in dense_allocations[1..].iter().enumerate() {
+            assert_eq!(
+                lengths,
+                [
+                    if round >= 4 { a_bytes } else { 0 },
+                    if round >= 5 { b_bytes } else { 0 }
+                ],
+                "dense allocations at round {round}, logT{log_t}"
+            );
+            assert_eq!(
+                identities,
+                [
+                    if round >= 4 { first_a } else { 0 },
+                    if round >= 5 { first_b } else { 0 }
+                ],
+                "dense allocations must be reused after their first consumer"
+            );
+        }
+        let deferred_allocation_count = usize::from(first_a != 0) + usize::from(first_b != 0);
+        assert_eq!(deferred_allocation_count, if rows == 32 { 1 } else { 2 });
+        assert_eq!(
+            dense_allocation_snapshot(&sequence),
+            *dense_allocations.last().unwrap()
+        );
+    }
+}
+
+#[test]
+fn ram_ra_dense_slabs_are_allocated_only_at_their_first_consumers() {
+    let context = SolinasMetal::for_akita().unwrap();
+    for (case, (log_t, log_k, chunk_bits, activity)) in [
+        (5, 8, 4, 1),
+        (6, 16, 8, 1),
+        (8, 24, 8, 2),
+        (8, 31, 4, 1),
+        (9, 21, 4, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        run_randomized_case(
+            &context,
+            log_t,
+            log_k,
+            chunk_bits,
+            0xde1a_0000 + case as u64,
+            activity,
+            true,
+        );
+    }
 }
 
 #[test]
 fn ram_ra_six_nibble_randomized_all_rounds_and_terminal_match_cpu() {
     let context = SolinasMetal::for_akita().unwrap();
     for (case, (log_t, activity)) in [(5, 1), (9, 1), (10, 2), (9, 0)].into_iter().enumerate() {
-        run_randomized_case(&context, log_t, 21, 4, 0xa6e7_0000 + case as u64, activity);
+        run_randomized_case(
+            &context,
+            log_t,
+            21,
+            4,
+            0xa6e7_0000 + case as u64,
+            activity,
+            false,
+        );
     }
 }
 
@@ -347,7 +456,15 @@ fn ram_ra_nibble_factor_boundaries_and_legacy_bytes_match_cpu() {
     .into_iter()
     .enumerate()
     {
-        run_randomized_case(&context, 8, log_k, chunk_bits, 0xb17e_0000 + case as u64, 1);
+        run_randomized_case(
+            &context,
+            8,
+            log_k,
+            chunk_bits,
+            0xb17e_0000 + case as u64,
+            1,
+            false,
+        );
     }
 }
 
@@ -400,7 +517,9 @@ fn ram_ra_terminal_bind_writes_gpu_claims_and_zeroes_unused_lanes() {
             // Isolate the terminal kernel with known resident factor pairs.
             // The all-round oracle above checks how real rounds reach here.
             let pairs = (0..2 * factors).map(|_| random.field()).collect::<Vec<_>>();
-            write_fields(&sequence.buffers.dense_a, factors * rows / 16, &pairs).unwrap();
+            let dense_a = new_field_buffer(&context, factors * rows / 16).unwrap();
+            write_fields(&dense_a, factors * rows / 16, &pairs).unwrap();
+            sequence.buffers.dense_a = Some(dense_a);
             write_fields(&sequence.buffers.partial_a, 8, &[-AkitaField::one(); 8]).unwrap();
             sequence.dense = true;
             sequence.dense_in_a = true;
