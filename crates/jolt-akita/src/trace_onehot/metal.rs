@@ -30,8 +30,22 @@ fn packed_metal_view(
         source.one_hot_k,
         selectors.hot_entries(),
         selectors.zero_suffix_start(),
+        selectors.maximum_selector(),
     ) {
-        (256, Some(hot_entries), Some(zero_suffix_start)) => {
+        (_, Some(hot_entries), Some(zero_suffix_start), Some(maximum_selector)) => {
+            akita_metal::PackedOneHotCommitView::new_with_precomputed_metrics(
+                source.one_hot_k,
+                source.column_capacity,
+                source.num_columns,
+                selectors.row_major(),
+                selectors.active_zero_rows(),
+                selectors.zero_column_mask(),
+                hot_entries,
+                zero_suffix_start,
+                maximum_selector,
+            )
+        }
+        (256, Some(hot_entries), Some(zero_suffix_start), None) => {
             akita_metal::PackedOneHotCommitView::new_k256_with_precomputed_metrics(
                 source.column_capacity,
                 source.num_columns,
@@ -42,7 +56,7 @@ fn packed_metal_view(
                 zero_suffix_start,
             )
         }
-        (256, Some(hot_entries), None) => {
+        (256, Some(hot_entries), None, _) => {
             akita_metal::PackedOneHotCommitView::new_k256_with_precomputed_hot_entries(
                 source.column_capacity,
                 source.num_columns,
@@ -202,6 +216,24 @@ impl<const D: usize>
         let packed = packed_metal_view(trace)?;
         self.packed_onehot_coefficient_packing::<D>(packed, plan.point)
             .map(|partials| vec![partials])
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl<const D: usize> RootCommitKernel<GroupedRootView<'_, D>, AkitaField, D>
+    for akita_metal::MetalBackend
+{
+    fn commit_inner_group(
+        &self,
+        prepared: &Self::PreparedSetup,
+        sources: Vec<GroupedRootView<'_, D>>,
+        plan: CommitInnerPlan,
+    ) -> Result<Vec<CommitInnerWitness<AkitaField>>, AkitaError> {
+        // Opening roots arrive precommitted. The capability is also available
+        // to callers that intentionally recompute an arbitrary grouped root.
+        self.record_opening_cpu_fallback(sources.len())
+            .map_err(|error| AkitaError::InvalidInput(error.to_string()))?;
+        CpuBackend::DEFAULT.commit_inner_group(prepared.cpu_prepared(), sources, plan)
     }
 }
 

@@ -258,7 +258,7 @@ fn prove_grouped_trace_metal(
         .ok_or_else(|| invalid_batch("Akita setup has no one-hot backend"))?;
     let prepared = metal.prepared_setup(setup_owner)?;
     let stack = akita_prover::ProverComputeStack::new(
-        (&CpuBackend::DEFAULT, cpu_prepared),
+        (&metal.backend, prepared.as_ref()),
         (&metal.backend, prepared.as_ref()),
         (&CpuBackend::DEFAULT, cpu_prepared),
         (&metal.backend, prepared.as_ref()),

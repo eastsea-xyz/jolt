@@ -52,6 +52,7 @@ struct PackedTraceRows {
     ram_digit_zero_mask: u64,
     hot_entries: usize,
     zero_suffix_start: usize,
+    maximum_selector: u8,
 }
 
 impl PackedTraceRows {
@@ -101,12 +102,13 @@ impl TraceOneHotRows for PackedTraceRows {
 
     fn packed_selectors(&self) -> Option<jolt_akita::TracePackedSelectors<'_>> {
         Some(
-            jolt_akita::TracePackedSelectors::new_with_precomputed_metrics(
+            jolt_akita::TracePackedSelectors::new_with_certified_metrics(
                 &self.selected_rows,
                 &self.ram_active_rows,
                 self.ram_digit_zero_mask,
                 self.hot_entries,
                 self.zero_suffix_start,
+                self.maximum_selector,
             ),
         )
     }
@@ -123,15 +125,15 @@ impl TraceOneHotRows for PackedTraceRows {
     }
 }
 
-/// Fills one row's selected-row bytes; returns whether the cycle makes a
-/// remappable RAM access (the only per-row fact the caller still needs — the
-/// bytecode column is total, so no cycle can be missing its slot).
+/// Fills one row's selected-row bytes and certifies their maximum during the
+/// same traversal. Also returns whether the cycle makes a remappable RAM access.
 fn fill_trace_row(
     row: OneHotTraceSourceRow,
     columns: &[OneHotTraceColumn],
     selected_rows: &mut [u8],
-) -> bool {
+) -> (bool, u8) {
     debug_assert_eq!(columns.len(), selected_rows.len());
+    let mut maximum_selector = 0u8;
     for (column, selected_row) in columns.iter().zip(selected_rows) {
         let row_index = match column {
             OneHotTraceColumn::Instruction(selector) => selector.chunk_u128(row.lookup_index.0),
@@ -144,8 +146,9 @@ fn fill_trace_row(
         };
         debug_assert!(row_index <= u8::MAX as usize);
         *selected_row = row_index as u8;
+        maximum_selector = maximum_selector.max(*selected_row);
     }
-    row.ram_address.0.is_some()
+    (row.ram_address.0.is_some(), maximum_selector)
 }
 
 fn committed_entry_count(
@@ -160,6 +163,38 @@ fn committed_entry_count(
             *selected_row != 0 || (ram_active && ram_digit_zero_mask & (1u64 << column) != 0)
         })
         .count()
+}
+
+#[cfg(test)]
+mod packed_selector_certificate_tests {
+    use super::*;
+
+    #[test]
+    fn selector_bound_is_accumulated_while_filling_each_row() {
+        for width in [4, 8] {
+            let columns = [
+                OneHotTraceColumn::Increment(BalancedIncColumn::Digit { width, index: 0 }),
+                OneHotTraceColumn::Increment(BalancedIncColumn::Digit { width, index: 1 }),
+                OneHotTraceColumn::Increment(BalancedIncColumn::Carry { width }),
+            ];
+            for increment in [-128, -16, -8, -1, 0, 7, 15, 127] {
+                for address in [None, Some(0)] {
+                    let row = OneHotTraceSourceRow {
+                        lookup_index: LookupIndex(0),
+                        bytecode_pc: BytecodePc(0),
+                        ram_address: RemappedRamAddress(address),
+                        fused_inc: FusedInc(increment),
+                    };
+                    let mut selectors = [u8::MAX; 3];
+                    let (ram_active, maximum_selector) =
+                        fill_trace_row(row, &columns, &mut selectors);
+                    assert_eq!(ram_active, address.is_some());
+                    assert_eq!(maximum_selector, *selectors.iter().max().unwrap());
+                    assert!(usize::from(maximum_selector) < 1usize << width);
+                }
+            }
+        }
+    }
 }
 
 /// Builds the row-major source for the native `OneHotTrace` commitment in the
@@ -221,9 +256,8 @@ pub fn assemble_one_hot_trace_rows<F: JoltField>(
         if physical_rows < num_rows {
             let padding = access.window::<OneHotTraceSourceRow>(physical_rows)?;
             let mut selected = vec![0u8; num_columns];
-            if fill_trace_row(padding, &columns, &mut selected)
-                || selected.iter().any(|&row| row != 0)
-            {
+            let (ram_active, maximum_selector) = fill_trace_row(padding, &columns, &mut selected);
+            if ram_active || maximum_selector != 0 {
                 num_rows
             } else {
                 physical_rows
@@ -242,19 +276,22 @@ pub fn assemble_one_hot_trace_rows<F: JoltField>(
             let extraction_error = std::sync::Mutex::new(None);
             let active_lane_count = zero_suffix_start * num_columns;
             let active_word_count = zero_suffix_start.div_ceil(u64::BITS as usize);
-            let hot_entries = selected_rows[..active_lane_count]
+            let (hot_entries, maximum_selector) = selected_rows[..active_lane_count]
                 .par_chunks_mut(num_columns * u64::BITS as usize)
                 .zip(ram_active_rows[..active_word_count].par_iter_mut())
                 .enumerate()
                 .map(|(word_index, (word_rows, ram_active_word))| {
                     let mut hot_entries = 0usize;
+                    let mut maximum_selector = 0u8;
                     for (row_offset, selected_rows) in
                         word_rows.chunks_exact_mut(num_columns).enumerate()
                     {
                         let row_index = word_index * u64::BITS as usize + row_offset;
                         match access.window::<OneHotTraceSourceRow>(row_index) {
                             Ok(row) => {
-                                let ram_active = fill_trace_row(row, &columns, selected_rows);
+                                let (ram_active, row_maximum) =
+                                    fill_trace_row(row, &columns, selected_rows);
+                                maximum_selector = maximum_selector.max(row_maximum);
                                 if ram_active {
                                     *ram_active_word |= 1u64 << row_offset;
                                 }
@@ -271,9 +308,14 @@ pub fn assemble_one_hot_trace_rows<F: JoltField>(
                             }
                         }
                     }
-                    hot_entries
+                    (hot_entries, maximum_selector)
                 })
-                .sum();
+                .reduce(
+                    || (0, 0),
+                    |(left_count, left_maximum), (right_count, right_maximum)| {
+                        (left_count + right_count, left_maximum.max(right_maximum))
+                    },
+                );
             #[expect(clippy::unwrap_used, reason = "no lock user can panic")]
             if let Some(error) = extraction_error.into_inner().unwrap() {
                 return Err(error.into());
@@ -286,18 +328,21 @@ pub fn assemble_one_hot_trace_rows<F: JoltField>(
                 ram_digit_zero_mask,
                 hot_entries,
                 zero_suffix_start,
+                maximum_selector,
             }));
         }
     }
 
     let rows: Vec<OneHotTraceSourceRow> = collect_bundles(witness, num_rows)?;
     let mut hot_entries = 0usize;
+    let mut maximum_selector = 0u8;
     for (row_index, (row, selected_rows)) in rows
         .into_iter()
         .zip(selected_rows.chunks_exact_mut(num_columns))
         .enumerate()
     {
-        let ram_active = fill_trace_row(row, &columns, selected_rows);
+        let (ram_active, row_maximum) = fill_trace_row(row, &columns, selected_rows);
+        maximum_selector = maximum_selector.max(row_maximum);
         if ram_active {
             ram_active_rows[row_index / u64::BITS as usize] |=
                 1u64 << (row_index % u64::BITS as usize);
@@ -312,6 +357,7 @@ pub fn assemble_one_hot_trace_rows<F: JoltField>(
         ram_digit_zero_mask,
         hot_entries,
         zero_suffix_start,
+        maximum_selector,
     }))
 }
 
