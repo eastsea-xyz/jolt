@@ -91,6 +91,7 @@ fn generate_advice() -> AkitaFixtureCase {
         &config,
         true,
         true,
+        None,
     )
     .expect("Akita advice preprocessing");
     prove_prepared(run, config, preprocessing, &trusted_advice)

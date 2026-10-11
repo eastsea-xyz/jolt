@@ -189,7 +189,7 @@ mod packed_selector_certificate_tests {
                     let (ram_active, maximum_selector) =
                         fill_trace_row(row, &columns, &mut selectors);
                     assert_eq!(ram_active, address.is_some());
-                    assert_eq!(maximum_selector, *selectors.iter().max().unwrap());
+                    assert_eq!(Some(maximum_selector), selectors.iter().copied().max());
                     assert!(usize::from(maximum_selector) < 1usize << width);
                 }
             }

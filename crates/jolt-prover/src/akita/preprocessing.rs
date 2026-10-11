@@ -3,12 +3,11 @@ use std::sync::Arc;
 use ark_serialize::CanonicalSerialize;
 use jolt_akita::{
     AkitaField, AkitaProverSetup, AkitaScheduleArtifacts, AkitaScheme, AkitaSetupParams,
-    AkitaVerifierSetup, PrecommittedScheduleParams,
+    AkitaVerifierSetup, PrecommittedScheduleParams, SetupMatrixGenerator,
 };
 use jolt_claims::protocols::jolt::lattice::advice_packing_plan;
 use jolt_claims::protocols::jolt::{JoltAdviceKind, TracePolynomialOrder};
 use jolt_crypto::NoVectorCommitment;
-use jolt_openings::CommitmentScheme;
 use jolt_program::preprocess::JoltProgramPreprocessing;
 use jolt_transcript::LegacyBlake2bTranscript;
 use jolt_verifier::{
@@ -35,7 +34,7 @@ pub fn preprocess_full(
     program: JoltProgramPreprocessing,
     config: &ProverConfig,
 ) -> Result<AkitaProverPreprocessing, PreprocessingError> {
-    preprocess_full_with_advice(program, config, false, false)
+    preprocess_full_with_advice(program, config, false, false, None)
 }
 
 pub fn preprocess_full_with_advice(
@@ -43,10 +42,17 @@ pub fn preprocess_full_with_advice(
     config: &ProverConfig,
     untrusted_advice: bool,
     trusted_advice: bool,
+    matrix_generator: Option<&SetupMatrixGenerator<'_, AkitaField>>,
 ) -> Result<AkitaProverPreprocessing, PreprocessingError> {
     validate_trace_order(config)?;
-    let (pcs_setup, verifier_setup) =
-        grouped_setup(&program, config, untrusted_advice, trusted_advice, &[])?;
+    let (pcs_setup, verifier_setup) = grouped_setup(
+        &program,
+        config,
+        untrusted_advice,
+        trusted_advice,
+        &[],
+        matrix_generator,
+    )?;
     let preprocessing_digest = full_preprocessing_digest(&program)?;
     let verifier = JoltVerifierPreprocessing::new(
         ProgramPreprocessing::Full(Arc::new(program)),
@@ -96,6 +102,7 @@ fn grouped_setup(
     untrusted_advice: bool,
     trusted_advice: bool,
     direct_program_physical_vars: &[usize],
+    matrix_generator: Option<&SetupMatrixGenerator<'_, AkitaField>>,
 ) -> Result<(AkitaProverSetup, AkitaVerifierSetup), PreprocessingError> {
     let params = grouped_setup_params(
         program,
@@ -104,7 +111,10 @@ fn grouped_setup(
         trusted_advice,
         direct_program_physical_vars,
     )?;
-    Ok(AkitaScheme::setup(params)?)
+    Ok(AkitaScheme::setup_with_matrix_generator(
+        params,
+        matrix_generator,
+    )?)
 }
 
 /// The grouped packed setup parameters for one proof shape (see
@@ -173,7 +183,7 @@ pub fn preprocess_committed(
     config: &ProverConfig,
     bytecode_chunk_count: usize,
 ) -> Result<AkitaProverPreprocessing, PreprocessingError> {
-    preprocess_committed_with_advice(program, config, bytecode_chunk_count, false, false)
+    preprocess_committed_with_advice(program, config, bytecode_chunk_count, false, false, None)
 }
 
 pub fn preprocess_committed_with_advice(
@@ -182,6 +192,7 @@ pub fn preprocess_committed_with_advice(
     bytecode_chunk_count: usize,
     untrusted_advice: bool,
     trusted_advice: bool,
+    matrix_generator: Option<&SetupMatrixGenerator<'_, AkitaField>>,
 ) -> Result<AkitaProverPreprocessing, PreprocessingError> {
     validate_trace_order(config)?;
     let metadata =
@@ -224,6 +235,7 @@ pub fn preprocess_committed_with_advice(
         untrusted_advice,
         trusted_advice,
         &direct_program_physical_vars,
+        matrix_generator,
     )?;
     let verifier = JoltVerifierPreprocessing::new(
         ProgramPreprocessing::Committed(committed_program),

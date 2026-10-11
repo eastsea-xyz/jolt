@@ -100,6 +100,7 @@ impl AkitaPreprocessing {
         config: &ProverConfig,
         untrusted_advice: bool,
         trusted_advice: bool,
+        matrix_generator: Option<&jolt_akita::SetupMatrixGenerator<'_, F>>,
     ) -> Result<Arc<AkitaProverPreprocessing>, PreprocessingError> {
         let profile = telemetry::stage("shape.setup");
         let key = ShapeKey {
@@ -122,8 +123,15 @@ impl AkitaPreprocessing {
                 chunks,
                 untrusted_advice,
                 trusted_advice,
+                matrix_generator,
             )?,
-            None => preprocess_full_with_advice(program, config, untrusted_advice, trusted_advice)?,
+            None => preprocess_full_with_advice(
+                program,
+                config,
+                untrusted_advice,
+                trusted_advice,
+                matrix_generator,
+            )?,
         };
         let setup = Arc::new(setup);
         let _ = setups.insert(key, Arc::clone(&setup));
@@ -170,7 +178,7 @@ impl AkitaPreprocessing {
             (Some(setup), _) => setup.verifier.clone(),
             (None, Some(_)) => {
                 drop(verifiers);
-                let setup = self.setup_for(config, untrusted_advice, trusted_advice)?;
+                let setup = self.setup_for(config, untrusted_advice, trusted_advice, None)?;
                 verifiers = self
                     .verifier_setups
                     .lock()
@@ -403,7 +411,7 @@ fn with_backend_for_mode<R>(
     bytecode_len: usize,
     forced_failure: Option<ForcedMetalFailure>,
     mut build: impl FnMut(BackendMode) -> Result<AkitaBackend, Box<dyn StdError + Send + Sync>>,
-    mut f: impl FnMut(&AkitaBackend) -> Result<R, Box<dyn StdError + Send + Sync>>,
+    mut f: impl FnMut(&AkitaBackend, BackendMode) -> Result<R, Box<dyn StdError + Send + Sync>>,
 ) -> Result<R, Box<dyn StdError + Send + Sync>> {
     telemetry::metadata("backend_requested_mode", format!("{mode:?}"));
     telemetry::metadata("backend_mode", format!("{mode:?}"));
@@ -412,7 +420,7 @@ fn with_backend_for_mode<R>(
             return Err(ForcedMetalFailure::Initialize.error());
         }
         let backend = cached_backend(cache, mode, bytecode_len, &mut build)?;
-        let result = f(&backend);
+        let result = f(&backend, mode);
         if mode != BackendMode::Cpu
             && forced_failure == Some(ForcedMetalFailure::Prove)
             && result.is_ok()
@@ -438,14 +446,14 @@ fn with_backend_for_mode<R>(
             let cpu = cached_backend(cache, BackendMode::Cpu, bytecode_len, &mut build)?;
             // The closure only borrows the witness/setup. Calling prove again
             // creates a new transcript and session without cloning those inputs.
-            f(&cpu)
+            f(&cpu, BackendMode::Cpu)
         }
     }
 }
 
 fn with_backend<R>(
     bytecode_len: usize,
-    f: impl FnMut(&AkitaBackend) -> Result<R, Box<dyn StdError + Send + Sync>>,
+    f: impl FnMut(&AkitaBackend, BackendMode) -> Result<R, Box<dyn StdError + Send + Sync>>,
 ) -> Result<R, Box<dyn StdError + Send + Sync>> {
     let mode = backend_mode(bytecode_len);
     let forced_failure = forced_metal_failure(
@@ -564,7 +572,6 @@ pub fn prove_program(
         .into());
     }
     let has_untrusted_advice = !untrusted_advice.is_empty();
-    let setup = preprocessing.setup_for(&config, has_untrusted_advice, has_trusted_advice)?;
     let witness_config = JoltVmWitnessConfig::new(
         config.trace_length.ilog2() as usize,
         config.ram_K,
@@ -583,7 +590,77 @@ pub fn prove_program(
         let _profile = telemetry::stage("witness.trace_backend");
         WitnessTraceBackend::<OwnedTrace>::try_new(witness_config, witness_inputs)?
     };
-    let proof = with_backend(program_preprocessing.bytecode.code_size, |backend| {
+    let proof = with_backend(program_preprocessing.bytecode.code_size, |backend, mode| {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let metal = if mode == BackendMode::MetalFull {
+            backend.trace_commitment_backend().metal_backend()
+        } else {
+            None
+        };
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let generate: &jolt_akita::SetupMatrixGenerator<'_, F> = &|field_count, seed| {
+            // The factory runs in the dedicated backend pool. Its process
+            // counters overlap the calling setup span, so this is a supplement.
+            let profile = telemetry::asynchronous_stage("shape.matrix_gpu");
+            let metal = metal.as_ref().ok_or_else(|| {
+                jolt_akita::AkitaError::InvalidSetup(
+                    "MetalFull setup has no Metal matrix producer".to_owned(),
+                )
+            })?;
+            let output = metal
+                .derive_public_matrix_prefix(field_count, seed)
+                .map_err(|error| jolt_akita::AkitaError::InvalidSetup(error.to_string()))?;
+            let metrics = &output.metrics;
+            profile.metadata("field_count", field_count.to_string());
+            profile.metadata("gpu_field_elements", metrics.gpu_field_elements.to_string());
+            profile.metadata("pages", metrics.pages.to_string());
+            profile.metadata("command_buffers", metrics.command_buffers.to_string());
+            profile.metadata("output_bytes", metrics.output_bytes.to_string());
+            profile.metadata(
+                "peak_allocation_bytes",
+                metrics.peak_allocation_bytes.to_string(),
+            );
+            profile.metadata("cpu_fallback", metrics.cpu_fallback.to_string());
+            profile.metadata(
+                "gpu_active_seconds",
+                metrics.gpu_active_time.as_secs_f64().to_string(),
+            );
+            profile.metadata(
+                "command_wall_seconds",
+                metrics.command_wall_time.as_secs_f64().to_string(),
+            );
+            profile.metadata(
+                "buffer_setup_seconds",
+                metrics.buffer_setup_time.as_secs_f64().to_string(),
+            );
+            profile.metadata(
+                "readback_seconds",
+                metrics.readback_time.as_secs_f64().to_string(),
+            );
+            if let Some(reason) = &metrics.fallback_reason {
+                profile.metadata("fallback_reason", reason);
+            }
+            Ok(output.matrix)
+        };
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let matrix_generator = if mode == BackendMode::MetalFull {
+            Some(generate)
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        let matrix_generator = {
+            let _ = mode;
+            None
+        };
+        // A failed GPU producer has not entered the shape cache; the existing
+        // backend retry invokes this closure again with a fresh CPU backend.
+        let setup = preprocessing.setup_for(
+            &config,
+            has_untrusted_advice,
+            has_trusted_advice,
+            matrix_generator,
+        )?;
         Ok(jolt_prover::akita::prove::<
             F,
             PCS,

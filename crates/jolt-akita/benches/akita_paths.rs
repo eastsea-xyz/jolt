@@ -340,13 +340,13 @@ fn akita_case(num_vars: usize) -> AkitaCase {
         .expect("one-hot scheme"),
     );
     let backend_prover = dense_scheme
-        .setup_prover(num_vars, NUM_POLYS)
+        .setup_prover(num_vars, NUM_POLYS, None)
         .expect("Akita backend setup should succeed");
     let backend_prepared = CpuBackend::DEFAULT
         .prepare_setup(&backend_prover)
         .expect("Akita backend setup preparation should succeed");
     let one_hot_backend_prover = one_hot_scheme
-        .setup_prover(num_vars, NUM_POLYS)
+        .setup_prover(num_vars, NUM_POLYS, None)
         .expect("Akita one-hot backend setup should succeed");
     let one_hot_backend_prepared = CpuBackend::DEFAULT
         .prepare_setup(&one_hot_backend_prover)

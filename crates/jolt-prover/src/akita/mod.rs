@@ -166,6 +166,11 @@ where
         backend
     }
 
+    /// Commitment backend whose shared Metal producer can expand setup.
+    pub fn trace_commitment_backend(&self) -> &jolt_akita::TraceCommitmentBackend {
+        &self.trace_commitment
+    }
+
     /// Open the proof-scoped session that slot state lives in — the same
     /// contract as [`JoltBackend::begin_proof`].
     pub fn begin_proof(&self) -> ProofSession {

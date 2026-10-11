@@ -2,6 +2,99 @@ use std::{cell::Cell, ffi::OsStr, rc::Weak};
 
 use super::*;
 
+fn matrix_setup_fixture() -> (AkitaPreprocessing, ProverConfig) {
+    let config = ProverConfig::for_shape(1 << 12, 64);
+    let program = jolt_program::preprocess::JoltProgramPreprocessing::new(
+        Vec::new(),
+        Vec::new(),
+        MemoryLayout::default(),
+        0,
+        config.trace_length,
+        jolt_program::execution::JoltProgram::default().profile,
+    )
+    .expect("tiny program preprocessing without a guest build");
+    let shared = JoltSharedPreprocessing::new(program).expect("tiny preprocessing digest");
+    (AkitaPreprocessing::new(shared, None), config)
+}
+
+#[test]
+fn failed_matrix_generator_is_not_cached_before_fresh_cpu_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (preprocessing, config) = matrix_setup_fixture();
+    let cache = BackendCache::default();
+    let attempts = RefCell::new(Vec::new());
+    let generator_calls = AtomicUsize::new(0);
+    let generate: &jolt_akita::SetupMatrixGenerator<'_, F> = &|field_count, _seed| {
+        assert!(field_count > 0);
+        let _ = generator_calls.fetch_add(1, Ordering::SeqCst);
+        Err(jolt_akita::AkitaError::InvalidSetup(
+            "forced setup matrix producer failure".to_owned(),
+        ))
+    };
+    let setup = with_backend_for_mode(
+        &cache,
+        BackendMode::MetalFull,
+        2,
+        None,
+        |_| Ok(AkitaBackend::optimized()),
+        |_, actual_mode| {
+            attempts.borrow_mut().push(actual_mode);
+            let generator = (actual_mode == BackendMode::MetalFull).then_some(generate);
+            let result = preprocessing.setup_for(&config, false, false, generator);
+            if actual_mode == BackendMode::MetalFull {
+                assert!(result.is_err());
+                assert!(preprocessing
+                    .setups
+                    .lock()
+                    .expect("shape cache lock")
+                    .is_empty());
+            }
+            result.map_err(Into::into)
+        },
+    )
+    .expect("matrix producer failure retries setup with the canonical CPU producer");
+    assert_eq!(
+        *attempts.borrow(),
+        [BackendMode::MetalFull, BackendMode::Cpu]
+    );
+    assert_eq!(generator_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cache.borrow().as_ref().map(|(mode, _)| *mode),
+        Some(BackendMode::Cpu)
+    );
+    let cached = preprocessing
+        .setup_for(&config, false, false, None)
+        .expect("complete CPU setup is cached");
+    assert!(Arc::ptr_eq(&setup, &cached));
+    assert_eq!(
+        preprocessing.setups.lock().expect("shape cache lock").len(),
+        1
+    );
+}
+
+#[test]
+fn complete_shape_cache_reuses_cpu_setup_without_invoking_another_producer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (preprocessing, config) = matrix_setup_fixture();
+    let cpu = preprocessing
+        .setup_for(&config, false, false, None)
+        .expect("canonical CPU setup");
+    let generator_calls = AtomicUsize::new(0);
+    let generate: &jolt_akita::SetupMatrixGenerator<'_, F> = &|_, _| {
+        generator_calls.fetch_add(1, Ordering::SeqCst);
+        Err(jolt_akita::AkitaError::InvalidSetup(
+            "a cached shape must not invoke a new producer".to_owned(),
+        ))
+    };
+    let cached = preprocessing
+        .setup_for(&config, false, false, Some(generate))
+        .expect("cache is keyed by shape and canonical setup identity");
+    assert!(Arc::ptr_eq(&cpu, &cached));
+    assert_eq!(generator_calls.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn automatic_metal_is_limited_to_apple_silicon() {
     assert_eq!(
@@ -81,7 +174,7 @@ fn initialization_failure_falls_back_before_proving() {
             builds.borrow_mut().push(mode);
             Ok(AkitaBackend::optimized())
         },
-        |_| {
+        |_, _| {
             assert_eq!(
                 cache.borrow().as_ref().map(|(mode, _)| *mode),
                 Some(BackendMode::Cpu)
@@ -111,7 +204,7 @@ fn backend_initialization_errors_fall_back_without_a_metal_proof_attempt() {
             }
             Ok(AkitaBackend::optimized())
         },
-        |_| {
+        |_, _| {
             attempts.set(attempts.get() + 1);
             Ok(())
         },
@@ -144,7 +237,7 @@ fn runtime_failure_releases_the_failed_backend_before_cpu_retry() {
             builds.borrow_mut().push(mode);
             Ok(AkitaBackend::optimized())
         },
-        |_| {
+        |_, _| {
             attempts.set(attempts.get() + 1);
             if attempts.get() == 1 {
                 *failed_backend.borrow_mut() = cache
@@ -190,7 +283,7 @@ fn forced_prove_failure_discards_successful_metal_output_before_retry() {
         1,
         Some(ForcedMetalFailure::Prove),
         |_| Ok(AkitaBackend::optimized()),
-        |_| {
+        |_, _| {
             attempts.set(attempts.get() + 1);
             let metal =
                 cache.borrow().as_ref().map(|(mode, _)| *mode) == Some(BackendMode::MetalFull);
@@ -219,7 +312,7 @@ fn cpu_errors_are_returned_without_another_retry() {
         1,
         Some(ForcedMetalFailure::Prove),
         |_| Ok(AkitaBackend::optimized()),
-        |_| {
+        |_, _| {
             attempts.set(attempts.get() + 1);
             Err(IoError::new(ErrorKind::InvalidData, "original CPU error").into())
         },
@@ -243,7 +336,7 @@ fn cpu_fallback_error_is_returned_after_exactly_two_attempts() {
         1,
         None,
         |_| Ok(AkitaBackend::optimized()),
-        |_| {
+        |_, _| {
             attempts.set(attempts.get() + 1);
             let message = if attempts.get() == 1 {
                 "original Metal error"
@@ -272,7 +365,7 @@ fn a_later_proof_reinitializes_metal_and_reuses_a_successful_backend() {
                 builds.borrow_mut().push(mode);
                 Ok(AkitaBackend::optimized())
             },
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .expect("subsequent proofs must recover from a transient Metal error");
     }

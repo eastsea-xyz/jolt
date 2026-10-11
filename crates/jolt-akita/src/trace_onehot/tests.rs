@@ -582,6 +582,7 @@ fn d512_k256_commit_matches_canonical_accumulate() {
         SetupMatrixCapacity {
             num_field_elements: plan.n_a * POSITIONS * D,
         },
+        None,
     )
     .unwrap();
     let cpu = CpuBackend::DEFAULT;

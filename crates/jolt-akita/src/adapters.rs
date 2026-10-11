@@ -1154,16 +1154,17 @@ pub(crate) fn one_hot_setup_prover(
     setup: &AkitaVerifierSetup,
     max_num_vars: usize,
     max_num_polys: usize,
+    matrix_generator: Option<&akita_prover::SetupMatrixGenerator<'_, AkitaField>>,
 ) -> Result<AkitaBackendProverSetup, AkitaError> {
     with_backend_pool(|| match setup.one_hot_k {
         AKITA_ONE_HOT_K16 => setup
             .one_hot_k16_scheme()
             .map_err(|error| AkitaError::InvalidSetup(error.to_string()))?
-            .setup_prover(max_num_vars, max_num_polys),
+            .setup_prover(max_num_vars, max_num_polys, matrix_generator),
         AKITA_ONE_HOT_K256 => setup
             .one_hot_k256_scheme()
             .map_err(|error| AkitaError::InvalidSetup(error.to_string()))?
-            .setup_prover(max_num_vars, max_num_polys),
+            .setup_prover(max_num_vars, max_num_polys, matrix_generator),
         _ => unreachable!("one-hot K is validated before backend setup"),
     })
 }

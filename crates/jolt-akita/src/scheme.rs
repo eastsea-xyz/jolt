@@ -1,5 +1,5 @@
 use akita_pcs::{AkitaError, ComputeBackendSetup, CpuBackend};
-use akita_prover::{GroupContext, RootPolyMeta};
+use akita_prover::{GroupContext, RootPolyMeta, SetupMatrixGenerator};
 use akita_types::PrecommittedGroupProfiles;
 use jolt_crypto::Commitment;
 use jolt_field::CanonicalBytes;
@@ -82,6 +82,12 @@ impl TraceCommitmentBackend {
                 prepared: Arc::new(Mutex::new(HashMap::new())),
             }),
         })
+    }
+
+    /// Shared Metal producer for setup matrix expansion.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub fn metal_backend(&self) -> Option<akita_metal::MetalBackend> {
+        self.required_metal().map(|metal| metal.backend.clone())
     }
 
     pub fn mode_name(&self) -> &'static str {
@@ -775,6 +781,79 @@ impl Commitment for AkitaScheme {
 }
 
 impl AkitaScheme {
+    /// Build the canonical setup with an optional trusted matrix producer.
+    ///
+    /// The seed, catalog requirements, CPU prefix commitments and verifier
+    /// setup are identical across producers. The trait entry supplies `None`.
+    pub fn setup_with_matrix_generator(
+        params: AkitaSetupParams,
+        matrix_generator: Option<&SetupMatrixGenerator<'_, AkitaField>>,
+    ) -> Result<(AkitaProverSetup, AkitaVerifierSetup), OpeningsError> {
+        let verifier = Self::verifier_setup_shell(&params)?;
+        let one_hot_log_k = validate_one_hot_k(params.one_hot_k)
+            .map_err(|err| OpeningsError::InvalidSetup(err.to_string()))?;
+        let (backend_prover_setup, prepared_backend_setup, backend_verifier_setup) =
+            if params.flavor == AkitaSetupFlavor::OneHot {
+                (None, None, None)
+            } else {
+                let scheme = verifier.dense_scheme()?;
+                let backend_prover_setup = with_backend_pool(|| {
+                    scheme.setup_prover(
+                        params.max_num_vars,
+                        params.max_total_batch_polys,
+                        matrix_generator,
+                    )
+                })
+                .map_err(invalid_setup)?;
+                let prepared_backend_setup =
+                    with_backend_pool(|| CpuBackend::DEFAULT.prepare_setup(&backend_prover_setup))
+                        .map_err(invalid_setup)?;
+                let backend_verifier_setup =
+                    with_backend_pool(|| scheme.setup_verifier(&backend_prover_setup))
+                        .map_err(invalid_setup)?;
+                (
+                    Some(Arc::new(backend_prover_setup)),
+                    Some(Arc::new(prepared_backend_setup)),
+                    Some(backend_verifier_setup),
+                )
+            };
+        let (
+            one_hot_backend_prover_setup,
+            prepared_one_hot_backend_setup,
+            one_hot_backend_verifier_setup,
+        ) = if params.max_num_vars >= one_hot_log_k && params.flavor != AkitaSetupFlavor::Dense {
+            let backend_prover_setup = crate::adapters::one_hot_setup_prover(
+                &verifier,
+                params.max_num_vars,
+                params.max_total_batch_polys,
+                matrix_generator,
+            )
+            .map_err(invalid_setup)?;
+            let prepared_backend_setup =
+                with_backend_pool(|| CpuBackend::DEFAULT.prepare_setup(&backend_prover_setup))
+                    .map_err(invalid_setup)?;
+            let backend_verifier_setup =
+                crate::adapters::one_hot_setup_verifier(&verifier, &backend_prover_setup)?;
+            (
+                Some(Arc::new(backend_prover_setup)),
+                Some(Arc::new(prepared_backend_setup)),
+                Some(backend_verifier_setup),
+            )
+        } else {
+            (None, None, None)
+        };
+        verifier.prime_backend_cache(backend_verifier_setup, one_hot_backend_verifier_setup);
+        let prover = AkitaProverSetup {
+            backend_prover_setup,
+            prepared_backend_setup,
+            one_hot_backend_prover_setup,
+            prepared_one_hot_backend_setup,
+            schedule_artifacts: params.schedule_artifacts,
+            verifier: verifier.clone(),
+        };
+        Ok((prover, verifier))
+    }
+
     /// The verifier setup for `params` without any backend key: the exact
     /// setup-owned schedule catalogs plus the shape metadata. Cheap (no public
     /// matrix); backend keys are derived from it on demand.
@@ -893,64 +972,7 @@ impl CommitmentScheme for AkitaScheme {
     fn setup(
         params: Self::SetupParams,
     ) -> Result<(Self::ProverSetup, Self::VerifierSetup), OpeningsError> {
-        let verifier = Self::verifier_setup_shell(&params)?;
-        let one_hot_log_k = validate_one_hot_k(params.one_hot_k)
-            .map_err(|err| OpeningsError::InvalidSetup(err.to_string()))?;
-        let (backend_prover_setup, prepared_backend_setup, backend_verifier_setup) =
-            if params.flavor == AkitaSetupFlavor::OneHot {
-                (None, None, None)
-            } else {
-                let scheme = verifier.dense_scheme()?;
-                let backend_prover_setup = with_backend_pool(|| {
-                    scheme.setup_prover(params.max_num_vars, params.max_total_batch_polys)
-                })
-                .map_err(invalid_setup)?;
-                let prepared_backend_setup =
-                    with_backend_pool(|| CpuBackend::DEFAULT.prepare_setup(&backend_prover_setup))
-                        .map_err(invalid_setup)?;
-                let backend_verifier_setup =
-                    with_backend_pool(|| scheme.setup_verifier(&backend_prover_setup))
-                        .map_err(invalid_setup)?;
-                (
-                    Some(Arc::new(backend_prover_setup)),
-                    Some(Arc::new(prepared_backend_setup)),
-                    Some(backend_verifier_setup),
-                )
-            };
-        let (
-            one_hot_backend_prover_setup,
-            prepared_one_hot_backend_setup,
-            one_hot_backend_verifier_setup,
-        ) = if params.max_num_vars >= one_hot_log_k && params.flavor != AkitaSetupFlavor::Dense {
-            let backend_prover_setup = crate::adapters::one_hot_setup_prover(
-                &verifier,
-                params.max_num_vars,
-                params.max_total_batch_polys,
-            )
-            .map_err(invalid_setup)?;
-            let prepared_backend_setup =
-                with_backend_pool(|| CpuBackend::DEFAULT.prepare_setup(&backend_prover_setup))
-                    .map_err(invalid_setup)?;
-            let backend_verifier_setup =
-                crate::adapters::one_hot_setup_verifier(&verifier, &backend_prover_setup)?;
-            (
-                Some(Arc::new(backend_prover_setup)),
-                Some(Arc::new(prepared_backend_setup)),
-                Some(backend_verifier_setup),
-            )
-        } else {
-            (None, None, None)
-        };
-        verifier.prime_backend_cache(backend_verifier_setup, one_hot_backend_verifier_setup);
-        let prover = AkitaProverSetup {
-            backend_prover_setup,
-            prepared_backend_setup,
-            one_hot_backend_prover_setup,
-            prepared_one_hot_backend_setup,
-            schedule_artifacts: params.schedule_artifacts,
-            verifier: verifier.clone(),
-        };
-        Ok((prover, verifier))
+        Self::setup_with_matrix_generator(params, None)
     }
 
     fn verifier_setup(prover_setup: &Self::ProverSetup) -> Self::VerifierSetup {

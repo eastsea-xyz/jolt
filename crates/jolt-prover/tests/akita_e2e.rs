@@ -150,6 +150,7 @@ mod akita_tests {
             &config,
             untrusted_advice,
             has_trusted_advice,
+            None,
         )
         .expect("Akita preprocessing");
         let trusted = has_trusted_advice.then(|| {
@@ -471,6 +472,7 @@ mod akita_tests {
             1,
             true,
             true,
+            None,
         )
         .expect("committed Akita preprocessing");
         let trusted_object = preprocessing::commit_trusted_advice(&preprocessing, &trusted)
