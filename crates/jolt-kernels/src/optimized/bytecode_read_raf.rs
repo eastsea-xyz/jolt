@@ -263,6 +263,36 @@ pub(crate) fn prepare_bytecode_read_raf_address<F: JoltField>(
     )
 }
 
+// Bound the row-major source while retaining the final address-major columns.
+// The formula reads stored instruction addresses, so panels do not change its
+// global address or the order of field operations within an instruction.
+fn bytecode_stage_value_columns<F: JoltField>(
+    inputs: BytecodeReadRafStageValueInputs<'_, F>,
+) -> Vec<Vec<F>> {
+    const PANEL_ROWS: usize = 4096;
+    let mut columns = (0..NUM_BYTECODE_VAL_STAGES)
+        .map(|_| Vec::with_capacity(inputs.bytecode.len()))
+        .collect::<Vec<_>>();
+    for bytecode in inputs.bytecode.chunks(PANEL_ROWS) {
+        let rows = read_raf_stage_values(BytecodeReadRafStageValueInputs {
+            bytecode,
+            register_read_write_point: inputs.register_read_write_point,
+            register_val_evaluation_point: inputs.register_val_evaluation_point,
+            stage1_gammas: inputs.stage1_gammas,
+            stage2_gammas: inputs.stage2_gammas,
+            stage3_gammas: inputs.stage3_gammas,
+            stage4_gammas: inputs.stage4_gammas,
+            stage5_gammas: inputs.stage5_gammas,
+        });
+        for row in rows {
+            for (column, value) in columns.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+    }
+    columns
+}
+
 pub(crate) fn prepare_bytecode_read_raf_address_from_pushforwards<F: JoltField>(
     witness: &dyn JoltWitnessPlane<F>,
     inputs: ProverInputs<'_, F, BytecodeReadRafAddressPhase<F>>,
@@ -302,7 +332,7 @@ pub(crate) fn prepare_bytecode_read_raf_address_from_pushforwards<F: JoltField>(
         });
     }
     let stage_gammas = inputs.challenges.stage_gamma_powers();
-    let raw_stage_values = read_raf_stage_values(BytecodeReadRafStageValueInputs {
+    let stage_value_columns = bytecode_stage_value_columns(BytecodeReadRafStageValueInputs {
         bytecode: &program.bytecode.bytecode,
         register_read_write_point: &relation.register_read_write_point()[..REGISTER_ADDRESS_BITS],
         register_val_evaluation_point: &relation.register_val_evaluation_point()
@@ -318,8 +348,9 @@ pub(crate) fn prepare_bytecode_read_raf_address_from_pushforwards<F: JoltField>(
         .into_iter()
         .map(Polynomial::new)
         .collect::<Vec<_>>();
-    let values = (0..NUM_BYTECODE_VAL_STAGES)
-        .map(|stage| Polynomial::new(raw_stage_values.iter().map(|row| row[stage]).collect()))
+    let values = stage_value_columns
+        .into_iter()
+        .map(Polynomial::new)
         .collect::<Vec<_>>();
     let mut stage_values = (0..base_stages).map(StageVal::Table).collect::<Vec<_>>();
     if !fused_cycle_points.is_empty() {
@@ -1160,6 +1191,96 @@ impl<F: JoltField> SumcheckKernel<F> for CycleKernel<F> {
                 .map(|index| ra.value(index, 0))
         })
         .map_err(SumcheckKernelError::from)
+    }
+}
+
+#[cfg(test)]
+mod stage_value_column_tests {
+    use jolt_riscv::{JoltInstructionKind, JoltInstructionRow, NormalizedOperands};
+
+    use super::*;
+
+    fn compare_full_row_oracle<F: JoltField>() {
+        let panel_rows = 4096;
+        let mut bytecode = (0..=2 * panel_rows)
+            .map(|index| JoltInstructionRow {
+                instruction_kind: match index % 6 {
+                    0 => JoltInstructionKind::ADD,
+                    1 => JoltInstructionKind::BNE,
+                    2 => JoltInstructionKind::JAL,
+                    3 => JoltInstructionKind::SD,
+                    4 => JoltInstructionKind::LD,
+                    _ => JoltInstructionRow::default().instruction_kind,
+                },
+                // Addresses are stored data, not a position relative to a panel.
+                address: 100 + 7 * index,
+                operands: NormalizedOperands {
+                    rs1: Some((index % 32) as u8),
+                    rs2: Some(((index + 5) % 32) as u8),
+                    rd: Some(((index + 11) % 32) as u8),
+                    imm: if index.is_multiple_of(2) {
+                        index as i128 + 3
+                    } else {
+                        -(index as i128) - 3
+                    },
+                },
+                virtual_sequence_remaining: index.is_multiple_of(7).then_some(1),
+                is_first_in_sequence: index.is_multiple_of(11),
+                is_compressed: index.is_multiple_of(3),
+            })
+            .collect::<Vec<_>>();
+        // True padding straddles the first seam, followed by populated rows.
+        bytecode[panel_rows - 2..panel_rows + 3].fill(JoltInstructionRow::default());
+        let read_write_point = (0..REGISTER_ADDRESS_BITS)
+            .map(|index| F::from_u64(index as u64 + 2))
+            .collect::<Vec<_>>();
+        let val_point = (0..REGISTER_ADDRESS_BITS)
+            .map(|index| F::from_u64(index as u64 + 19))
+            .collect::<Vec<_>>();
+        let gammas: [Vec<F>; 5] = std::array::from_fn(|stage| {
+            (0..bytecode::BYTECODE_STAGE_GAMMA_COUNTS[stage])
+                .map(|index| F::from_u64(31 * stage as u64 + index as u64 + 7))
+                .collect()
+        });
+        for rows in [
+            0,
+            1,
+            panel_rows - 1,
+            panel_rows,
+            panel_rows + 1,
+            2 * panel_rows,
+            2 * panel_rows + 1,
+        ] {
+            let inputs = || BytecodeReadRafStageValueInputs {
+                bytecode: &bytecode[..rows],
+                register_read_write_point: &read_write_point,
+                register_val_evaluation_point: &val_point,
+                stage1_gammas: &gammas[0],
+                stage2_gammas: &gammas[1],
+                stage3_gammas: &gammas[2],
+                stage4_gammas: &gammas[3],
+                stage5_gammas: &gammas[4],
+            };
+            // Preserve the old full-input materialization as the independent
+            // oracle, including instruction data on both sides of each seam.
+            let full_rows = read_raf_stage_values(inputs());
+            let expected = (0..NUM_BYTECODE_VAL_STAGES)
+                .map(|stage| full_rows.iter().map(|row| row[stage]).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let actual = bytecode_stage_value_columns(inputs());
+            assert_eq!(actual, expected, "stage values differ for {rows} rows");
+        }
+    }
+
+    #[test]
+    fn bounded_stage_value_columns_match_full_rows_across_panel_seams() {
+        compare_full_row_oracle::<jolt_field::Fr>();
+    }
+
+    #[cfg(feature = "akita")]
+    #[test]
+    fn bounded_akita_stage_value_columns_match_full_rows_across_panel_seams() {
+        compare_full_row_oracle::<jolt_field::Prime128OffsetA7F7>();
     }
 }
 
